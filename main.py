@@ -162,7 +162,6 @@ async def list_models():
         if fake in seen:
             continue
         seen.add(fake)
-        # Real Vision (1) и Fake Vision (2) оба объявляются клиентам как поддерживающие Vision
         has_vision = is_vis in [1, 2]
         models_data.append({
             "id": fake,
@@ -516,7 +515,7 @@ def delete_model(row_id: int = Form(...), key: str = Depends(verify_admin)):
     load_data()
     return HTMLResponse(f"<script>location.href='/admin?key={key}';</script>")
 
-# --- Потоковый генератор с вырезанием <think> ---
+# --- Потоковый генератор с вырезанием <think> и сохранением tool_calls ---
 
 async def stream_filter_generator(upstream_response: httpx.Response, requested_model: str = None):
     line_buffer = ""
@@ -597,7 +596,14 @@ async def stream_filter_generator(upstream_response: httpx.Response, requested_m
                                     event_skipped = True
                                     continue
 
-                        if not delta.get("content") and not delta.get("role") and not choice.get("finish_reason"):
+                        # Не пропускаем чанки, если в них есть контент, роль, tool_calls, function_call или финиш-причина
+                        if (
+                            not delta.get("content")
+                            and not delta.get("role")
+                            and not delta.get("tool_calls")
+                            and not delta.get("function_call")
+                            and not choice.get("finish_reason")
+                        ):
                             event_skipped = True
                             continue
 
@@ -651,7 +657,6 @@ async def proxy(request: Request, path: str):
 
             if has_image:
                 if is_vis == 0:
-                    # 1. Модель строго без Vision -> возвращаем корректную ошибку OpenAI
                     return Response(
                         content=json.dumps({
                             "error": {
@@ -665,8 +670,6 @@ async def proxy(request: Request, path: str):
                         media_type="application/json"
                     )
                 elif is_vis == 2:
-                    # 2. FAKE VISION: Безопасно очищаем картинки, заменяя их текстовым маркером,
-                    # чтобы текстовый апстрим не крашнулся с 400 Bad Request
                     for msg in messages:
                         content = msg.get("content")
                         if isinstance(content, list):
