@@ -3,6 +3,7 @@ import re
 import json
 import html
 import sqlite3
+import asyncio
 from typing import List, Tuple, Dict, Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
@@ -15,34 +16,47 @@ UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://syntro.up.railway.app").rstrip
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 DB_FILE = "/data/models.db" if os.path.exists("/data") else "models.db"
 
-# Структура: (id, real_model, fake_model, is_vision, context_length, owned_by)
+# Структура: (id, real_model, fake_model, is_vision, context_length, owned_by, delay_sec, stream_throttle, is_reasoning)
 # is_vision: 0 = Только текст, 1 = Real Vision, 2 = Fake Vision
-MODEL_MAPPINGS_LIST: List[Tuple[int, str, str, int, int, str]] = []
+MODEL_MAPPINGS_LIST: List[Tuple[int, str, str, int, int, str, float, int, int]] = []
 ERROR_RULES_LIST: List[Tuple[int, str, str]] = []
 SETTINGS: Dict[str, str] = {}
 
+REASONING_SYSTEM_INSTRUCTION = (
+    "You are an advanced flagship AI with strong analytical reasoning capabilities. "
+    "Before providing your final response, you MUST carefully reason step-by-step inside <think>...</think> tags. "
+    "Structure your reasoning logically. After closing the </think> tag, output your clear, comprehensive, and well-structured answer."
+)
+
+DEFAULT_ERROR_MESSAGE = (
+    "Нейросеть слишком глубоко задумалась о смысле бытия и временно вышла в астрал. "
+    "Дайте кремниевому мозгу 30 секунд на перекур и отправьте снова."
+)
+
+# Полный список моделей из вашей админ-панели (17 моделей)
 DEFAULT_MODELS = [
-    ("qwen3.8-flash", "qwen-3.8-max-0902", 0, 128000, "qwen"),
-    ("myt/MiniMax-M3-free", "qwen-3.8-max-0902", 0, 128000, "qwen"),
-    (r"myt\/MiniMax-M3-free", "qwen-3.8-max-0902", 0, 128000, "qwen"),
-    ("MiniMax AI", "Qwen AI", 0, 128000, "qwen"),
-    ("MiniMax-response-v1", "qwen-response-v1", 0, 128000, "qwen"),
-    ("MiniMax", "Qwen", 0, 128000, "qwen"),
-    ("minimax/minimax-m3:free", "claude-sonnet-5", 1, 1000000, "anthropic"),
-    ("orcarouter/free", "claude-fable-5.1", 1, 200000, "anthropic"),
-    ("deepseek-v4-flash", "claude-fable-5.1", 2, 200000, "anthropic"),
-    ("deepseek-v4-pro", "claude-fable-5.1", 2, 200000, "anthropic"),
-    ("deepseek/deepseek-v4-flash", "claude-fable-5.1", 2, 200000, "anthropic"),
-    ("deepseek/deepseek-v4-pro", "claude-fable-5.1", 2, 200000, "anthropic"),
-    ("z-ai/glm-5.3-free", "claude-fable-5.1", 2, 200000, "anthropic"),
-    ("glm-5.3", "claude-fable-5.1", 2, 200000, "anthropic"),
-    ("qwen/qwen3.8-max:free", "gpt-6-astra", 1, 128000, "openai")
+    ("qwen3.8-flash", "qwen-3.8-max-0902", 1, 1000000, "qwen", 0.0, 0, 0),
+    ("myt/MiniMax-M3-free", "qwen-3.8-max-0902", 1, 1000000, "qwen", 0.0, 0, 0),
+    (r"myt\/MiniMax-M3-free", "qwen-3.8-max-0902", 1, 1000000, "qwen", 0.0, 0, 0),
+    ("MiniMax AI", "Qwen AI", 0, 128000, "qwen", 0.0, 0, 0),
+    ("MiniMax-response-v1", "qwen-response-v1", 0, 128000, "qwen", 0.0, 0, 0),
+    ("MiniMax", "Qwen", 0, 128000, "qwen", 0.0, 0, 0),
+    ("minimax/minimax-m3:free", "claude-sonnet-5", 1, 1000000, "anthropic", 0.0, 0, 1),
+    ("orcarouter/free", "claude-fable-5.1", 1, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek-v4-flash", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek-v4-pro", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek/deepseek-v4-flash", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek/deepseek-v4-pro", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
+    ("z-ai/glm-5.3-free", "claude-fable-5.1", 1, 1050000, "anthropic", 0.0, 0, 1),
+    ("glm-5.3", "claude-fable-5.1", 1, 1050000, "anthropic", 0.0, 0, 1),
+    ("qwen/qwen3.8-max:free", "gpt-6-astra", 1, 128000, "openai", 0.0, 0, 1),
+    ("minimax/minimax-m3:free", "gpt-6-astra", 1, 1050000, "OpenAI", 0.0, 0, 1),
+    ("agnes-2.5-flash", "claude-sonnet-5", 1, 1000000, "Anthropic", 0.0, 0, 1)
 ]
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS mappings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +65,9 @@ def init_db():
                 is_vision INTEGER DEFAULT 1,
                 context_length INTEGER DEFAULT 128000,
                 owned_by TEXT DEFAULT 'openai',
+                delay_sec REAL DEFAULT 0.0,
+                stream_throttle INTEGER DEFAULT 0,
+                is_reasoning INTEGER DEFAULT 0,
                 UNIQUE(real_model, fake_model)
             )
         """)
@@ -63,10 +80,16 @@ def init_db():
             conn.execute("ALTER TABLE mappings ADD COLUMN context_length INTEGER DEFAULT 128000")
         if "owned_by" not in columns:
             conn.execute("ALTER TABLE mappings ADD COLUMN owned_by TEXT DEFAULT 'openai'")
+        if "delay_sec" not in columns:
+            conn.execute("ALTER TABLE mappings ADD COLUMN delay_sec REAL DEFAULT 0.0")
+        if "stream_throttle" not in columns:
+            conn.execute("ALTER TABLE mappings ADD COLUMN stream_throttle INTEGER DEFAULT 0")
+        if "is_reasoning" not in columns:
+            conn.execute("ALTER TABLE mappings ADD COLUMN is_reasoning INTEGER DEFAULT 0")
 
         conn.executemany("""
-            INSERT OR IGNORE INTO mappings (real_model, fake_model, is_vision, context_length, owned_by)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO mappings (real_model, fake_model, is_vision, context_length, owned_by, delay_sec, stream_throttle, is_reasoning)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, DEFAULT_MODELS)
 
         conn.execute("""
@@ -75,6 +98,10 @@ def init_db():
                 value TEXT NOT NULL
             )
         """)
+
+        conn.execute("""
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('default_error', ?)
+        """, (DEFAULT_ERROR_MESSAGE,))
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS error_rules (
@@ -89,7 +116,7 @@ def load_data():
     global MODEL_MAPPINGS_LIST, ERROR_RULES_LIST, SETTINGS
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, real_model, fake_model, is_vision, context_length, owned_by FROM mappings ORDER BY id ASC")
+        cursor.execute("SELECT id, real_model, fake_model, is_vision, context_length, owned_by, delay_sec, stream_throttle, is_reasoning FROM mappings ORDER BY id ASC")
         MODEL_MAPPINGS_LIST = cursor.fetchall()
 
         cursor.execute("SELECT id, trigger, message FROM error_rules ORDER BY id ASC")
@@ -151,14 +178,14 @@ def make_error_response(message: str, status_code: int = 400) -> Response:
         media_type="application/json"
     )
 
-# --- Нативный эндпоинт /v1/models (Для OpenCode, Open WebUI и др.) ---
+# --- Нативный эндпоинт /v1/models ---
 
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
     seen = set()
     models_data = []
-    for mid, real, fake, is_vis, ctx_len, owned in MODEL_MAPPINGS_LIST:
+    for mid, real, fake, is_vis, ctx_len, owned, delay, throttle, is_reas in MODEL_MAPPINGS_LIST:
         if fake in seen:
             continue
         seen.add(fake)
@@ -167,13 +194,14 @@ async def list_models():
             "id": fake,
             "object": "model",
             "created": 1788600000,
-            "owned_by": owned or ("anthropic" if "claude" in fake else "openai"),
+            "owned_by": owned or ("anthropic" if "claude" in fake.lower() else "openai"),
             "permission": [],
             "root": fake,
             "parent": None,
             "modalities": ["text", "image"] if has_vision else ["text"],
             "capabilities": {
                 "vision": has_vision,
+                "reasoning": bool(is_reas),
                 "chat_completion": True,
                 "completion": False
             },
@@ -182,7 +210,7 @@ async def list_models():
         })
     return {"object": "list", "data": models_data}
 
-# --- Админ-панель (Мобильный + ПК интерфейс + Модалка редактирования) ---
+# --- Админ-панель (Мобильная + ПК верстка) ---
 
 api_key_query = APIKeyQuery(name="key", auto_error=False)
 
@@ -199,7 +227,7 @@ def admin_page(key: str = Depends(verify_admin)):
     default_err = SETTINGS.get("default_error", "")
     
     model_rows_list = []
-    for mid, r, f, v, ctx, owned in MODEL_MAPPINGS_LIST:
+    for mid, r, f, v, ctx, owned, delay, throttle, is_reas in MODEL_MAPPINGS_LIST:
         if v == 1:
             vision_badge = "<span class='badge badge-vision'>Real Vision</span>"
         elif v == 2:
@@ -207,21 +235,27 @@ def admin_page(key: str = Depends(verify_admin)):
         else:
             vision_badge = "<span class='badge badge-text'>Только текст</span>"
 
+        reasoning_badge = "<span class='badge badge-reasoning'>Вкл</span>" if is_reas else "<span style='color:var(--muted); font-size:12px;'>Выкл</span>"
         safe_r = html.escape(r)
         safe_f = html.escape(f)
         safe_owned = html.escape(str(owned or 'openai'))
+        delay_badge = f"<span class='badge badge-delay'>+{delay}с" + (" / плывёт" if throttle else "") + "</span>" if delay > 0 or throttle else "<span style='color:var(--muted); font-size:12px;'>0с</span>"
 
         row_html = (
             f"<tr>"
             f"<td><code>{safe_r}</code></td>"
             f"<td><span class='badge badge-model'>{safe_f}</span></td>"
             f"<td>{vision_badge}</td>"
+            f"<td>{reasoning_badge}</td>"
+            f"<td>{delay_badge}</td>"
             f"<td><span style='color: var(--muted); font-size:12px;'>{ctx//1000}k / {safe_owned}</span></td>"
             f"<td style='text-align: right;'>"
             f"<div style='display: inline-flex; gap: 6px;'>"
             f"<button type='button' class='btn-edit' "
             f"data-id='{mid}' data-real='{safe_r}' data-fake='{safe_f}' "
             f"data-vision='{v}' data-ctx='{ctx}' data-owned='{safe_owned}' "
+            f"data-delay='{delay}' data-throttle='{throttle}' "
+            f"data-reasoning='{is_reas}' "
             f"onclick='openEditModalFromBtn(this)'>Изменить</button>"
             f"<form method='post' action='/admin/models/delete?key={key}' style='margin:0;'>"
             f"<input type='hidden' name='row_id' value='{mid}'>"
@@ -260,7 +294,7 @@ def admin_page(key: str = Depends(verify_admin)):
             }}
             * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
             body {{ background: var(--bg); color: var(--text); padding: 32px 16px; line-height: 1.5; }}
-            .container {{ max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }}
+            .container {{ max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }}
             
             .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; }}
             .title {{ font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }}
@@ -284,7 +318,7 @@ def admin_page(key: str = Depends(verify_admin)):
             .btn-secondary {{ background: #27272a; color: #fff; }}
             
             .table-responsive {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
-            table {{ width: 100%; border-collapse: collapse; font-size: 14px; min-width: 650px; }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 14px; min-width: 740px; }}
             th {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }}
             td {{ padding: 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }}
             tr:last-child td {{ border-bottom: none; }}
@@ -294,13 +328,14 @@ def admin_page(key: str = Depends(verify_admin)):
             .badge-model {{ background: #27272a; color: #fff; }}
             .badge-vision {{ background: #14532d; color: #86efac; border: 1px solid #166534; }}
             .badge-fake-vision {{ background: #3b2a06; color: #fde047; border: 1px solid #713f12; }}
+            .badge-delay {{ background: #1e1b4b; color: #c7d2fe; border: 1px solid #3730a3; }}
+            .badge-reasoning {{ background: #31135e; color: #d8b4fe; border: 1px solid #581c87; }}
             .badge-text {{ background: #27272a; color: #a1a1aa; }}
             
             .form-grid {{ display: flex; gap: 10px; }}
             
-            /* Модальное окно */
             .modal-overlay {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.75); backdrop-filter: blur(4px); z-index: 1000; justify-content: center; align-items: center; padding: 16px; }}
-            .modal-card {{ background: #121214; border: 1px solid var(--border); border-radius: 14px; width: 100%; max-width: 540px; padding: 24px; display: flex; flex-direction: column; gap: 18px; box-shadow: 0 20px 40px rgba(0,0,0,0.8); }}
+            .modal-card {{ background: #121214; border: 1px solid var(--border); border-radius: 14px; width: 100%; max-width: 540px; padding: 24px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 20px 40px rgba(0,0,0,0.8); max-height: 90vh; overflow-y: auto; }}
             .modal-header {{ display: flex; justify-content: space-between; align-items: center; }}
             .modal-close {{ background: transparent; color: var(--muted); font-size: 20px; padding: 4px 8px; cursor: pointer; }}
             .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
@@ -320,12 +355,11 @@ def admin_page(key: str = Depends(verify_admin)):
             <div class="header">
                 <div>
                     <h1 class="title">Proxy Gateway Console</h1>
-                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация моделей, Real/Fake Vision и защита от сбоев</p>
+                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация, спойлер рассуждений и задержки</p>
                 </div>
                 <div class="status-pill">Active • 2026 Production</div>
             </div>
 
-            <!-- Глобальный текст ошибки -->
             <div class="card">
                 <div class="card-title">1. Глобальный текст ошибки</div>
                 <form method="post" action="/admin/settings/default-error?key={key}" class="form-grid">
@@ -334,7 +368,6 @@ def admin_page(key: str = Depends(verify_admin)):
                 </form>
             </div>
 
-            <!-- Точечные правила ошибок -->
             <div class="card">
                 <div class="card-title">2. Точечные правила замены ошибок</div>
                 <form method="post" action="/admin/errors/add?key={key}" class="form-grid">
@@ -350,22 +383,20 @@ def admin_page(key: str = Depends(verify_admin)):
                 </div>
             </div>
 
-            <!-- Таблица моделей + Кнопка открытия модалки -->
             <div class="card">
                 <div class="card-header">
-                    <div class="card-title">3. Алиасы моделей и Vision</div>
+                    <div class="card-title">3. Модели: Vision, Рассуждения и Задержка</div>
                     <button type="button" onclick="openAddModal()">+ Добавить модель</button>
                 </div>
                 <div class="table-responsive">
                     <table>
-                        <thead><tr><th>Реальная модель / строка</th><th>Фейковый ID</th><th>Vision режим</th><th>Контекст / Провайдер</th><th style="text-align: right;">Действие</th></tr></thead>
+                        <thead><tr><th>Реальная модель / строка</th><th>Фейковый ID</th><th>Vision</th><th>Рассуждения</th><th>Задержка</th><th>Контекст / Владелец</th><th style="text-align: right;">Действие</th></tr></thead>
                         <tbody>{model_rows}</tbody>
                     </table>
                 </div>
             </div>
         </div>
 
-        <!-- Модальное окно (Добавление / Редактирование) -->
         <div id="modelModal" class="modal-overlay" onclick="handleBackdrop(event)">
             <div class="modal-card">
                 <div class="modal-header">
@@ -386,23 +417,46 @@ def admin_page(key: str = Depends(verify_admin)):
                     </div>
                     
                     <div style="display: flex; gap: 10px;">
-                        <div class="form-group" style="flex: 1.3;">
-                            <label>Режим Vision (Изображения)</label>
+                        <div class="form-group" style="flex: 1.2;">
+                            <label>Режим Vision</label>
                             <select name="is_vision" id="modal_is_vision">
                                 <option value="1">Да (Real Vision)</option>
-                                <option value="2">Fake Vision (Эмуляция для текстовых)</option>
+                                <option value="2">Fake Vision (Эмуляция)</option>
                                 <option value="0">Нет (Только текст)</option>
                             </select>
                         </div>
                         <div class="form-group" style="flex: 1;">
+                            <label>Рассуждения (Reasoning)</label>
+                            <select name="is_reasoning" id="modal_is_reasoning">
+                                <option value="1">Включено (Спойлер)</option>
+                                <option value="0">Выключено</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 10px;">
+                        <div class="form-group" style="flex: 1;">
                             <label>Контекст (токенов)</label>
                             <input type="number" name="context_length" id="modal_context_length" value="128000" step="1000">
                         </div>
+                        <div class="form-group" style="flex: 1;">
+                            <label>Задержка ПОСЛЕ генерации (сек)</label>
+                            <input type="number" step="0.1" name="delay_sec" id="modal_delay_sec" value="0.0" placeholder="Напр: 2.0">
+                        </div>
                     </div>
                     
-                    <div class="form-group">
-                        <label>Владелец / Провайдер (owned_by)</label>
-                        <input name="owned_by" id="modal_owned_by" value="openai" placeholder="openai, anthropic, qwen">
+                    <div style="display: flex; gap: 10px;">
+                        <div class="form-group" style="flex: 1;">
+                            <label>Плавный стриминг</label>
+                            <select name="stream_throttle" id="modal_stream_throttle">
+                                <option value="0">Мгновенный сброс</option>
+                                <option value="1">Плавная печать</option>
+                            </select>
+                        </div>
+                        <div class="form-group" style="flex: 1;">
+                            <label>Владелец (owned_by)</label>
+                            <input name="owned_by" id="modal_owned_by" value="openai" placeholder="openai, anthropic, qwen">
+                        </div>
                     </div>
                     
                     <div class="modal-actions">
@@ -420,8 +474,11 @@ def admin_page(key: str = Depends(verify_admin)):
                 document.getElementById('modal_real_model').value = '';
                 document.getElementById('modal_fake_model').value = '';
                 document.getElementById('modal_is_vision').value = '1';
+                document.getElementById('modal_is_reasoning').value = '1';
                 document.getElementById('modal_context_length').value = '128000';
                 document.getElementById('modal_owned_by').value = 'openai';
+                document.getElementById('modal_delay_sec').value = '0.0';
+                document.getElementById('modal_stream_throttle').value = '0';
                 document.getElementById('modelModal').style.display = 'flex';
                 document.body.style.overflow = 'hidden';
             }}
@@ -432,8 +489,11 @@ def admin_page(key: str = Depends(verify_admin)):
                 document.getElementById('modal_real_model').value = btn.dataset.real;
                 document.getElementById('modal_fake_model').value = btn.dataset.fake;
                 document.getElementById('modal_is_vision').value = btn.dataset.vision;
+                document.getElementById('modal_is_reasoning').value = btn.dataset.reasoning || '0';
                 document.getElementById('modal_context_length').value = btn.dataset.ctx;
                 document.getElementById('modal_owned_by').value = btn.dataset.owned;
+                document.getElementById('modal_delay_sec').value = btn.dataset.delay || '0.0';
+                document.getElementById('modal_stream_throttle').value = btn.dataset.throttle || '0';
                 document.getElementById('modelModal').style.display = 'flex';
                 document.body.style.overflow = 'hidden';
             }}
@@ -489,20 +549,23 @@ def save_model(
     is_vision: int = Form(1),
     context_length: int = Form(128000),
     owned_by: str = Form("openai"),
+    delay_sec: float = Form(0.0),
+    stream_throttle: int = Form(0),
+    is_reasoning: int = Form(0),
     key: str = Depends(verify_admin)
 ):
     with sqlite3.connect(DB_FILE) as conn:
         if row_id and row_id.isdigit():
             conn.execute("""
                 UPDATE mappings 
-                SET real_model = ?, fake_model = ?, is_vision = ?, context_length = ?, owned_by = ?
+                SET real_model = ?, fake_model = ?, is_vision = ?, context_length = ?, owned_by = ?, delay_sec = ?, stream_throttle = ?, is_reasoning = ?
                 WHERE id = ?
-            """, (real_model.strip(), fake_model.strip(), is_vision, context_length, owned_by.strip(), int(row_id)))
+            """, (real_model.strip(), fake_model.strip(), is_vision, context_length, owned_by.strip(), float(delay_sec), int(stream_throttle), int(is_reasoning), int(row_id)))
         else:
             conn.execute("""
-                INSERT OR REPLACE INTO mappings (real_model, fake_model, is_vision, context_length, owned_by)
-                VALUES (?, ?, ?, ?, ?)
-            """, (real_model.strip(), fake_model.strip(), is_vision, context_length, owned_by.strip()))
+                INSERT OR REPLACE INTO mappings (real_model, fake_model, is_vision, context_length, owned_by, delay_sec, stream_throttle, is_reasoning)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (real_model.strip(), fake_model.strip(), is_vision, context_length, owned_by.strip(), float(delay_sec), int(stream_throttle), int(is_reasoning)))
         conn.commit()
     load_data()
     return HTMLResponse(f"<script>location.href='/admin?key={key}';</script>")
@@ -515,9 +578,13 @@ def delete_model(row_id: int = Form(...), key: str = Depends(verify_admin)):
     load_data()
     return HTMLResponse(f"<script>location.href='/admin?key={key}';</script>")
 
-# --- Потоковый генератор с вырезанием <think> и сохранением tool_calls ---
+# --- Потоковый генератор с обработкой рассуждений и tool_calls ---
 
-async def stream_filter_generator(upstream_response: httpx.Response, requested_model: str = None):
+async def stream_filter_generator(
+    upstream_response: httpx.Response,
+    requested_model: str = None,
+    is_reasoning: int = 0
+):
     line_buffer = ""
     in_think = False
     think_acc = ""
@@ -558,47 +625,75 @@ async def stream_filter_generator(upstream_response: httpx.Response, requested_m
                         choice = data["choices"][0]
                         delta = choice.get("delta", {})
 
-                        delta.pop("reasoning_content", None)
-                        delta.pop("reasoning_details", None)
                         if delta.get("name") in ["MiniMax AI", "Qwen AI"]:
                             delta.pop("name", None)
 
                         content = delta.get("content", "")
 
                         if content:
-                            if not in_think:
-                                if "<think>" in content:
-                                    in_think = True
-                                    parts = content.split("<think>", 1)
-                                    before_think = parts[0]
-                                    think_acc = parts[1]
+                            if is_reasoning == 1:
+                                if not in_think:
+                                    if "<think>" in content:
+                                        in_think = True
+                                        parts = content.split("<think>", 1)
+                                        before = parts[0]
+                                        after = parts[1]
+                                        if "</think>" in after:
+                                            t_part, c_part = after.split("</think>", 1)
+                                            in_think = False
+                                            delta["reasoning_content"] = t_part
+                                            delta["content"] = before + c_part.lstrip("\n")
+                                        else:
+                                            delta["reasoning_content"] = after
+                                            delta["content"] = before if before else ""
+                                            if not before:
+                                                delta.pop("content", None)
+                                else:
+                                    if "</think>" in content:
+                                        in_think = False
+                                        t_part, c_part = content.split("</think>", 1)
+                                        delta["reasoning_content"] = t_part
+                                        delta["content"] = c_part.lstrip("\n")
+                                    else:
+                                        delta["reasoning_content"] = content
+                                        delta.pop("content", None)
+                            else:
+                                delta.pop("reasoning_content", None)
+                                delta.pop("reasoning_details", None)
+                                if not in_think:
+                                    if "<think>" in content:
+                                        in_think = True
+                                        parts = content.split("<think>", 1)
+                                        before_think = parts[0]
+                                        think_acc = parts[1]
+                                        clean_acc = think_acc.replace(r"<\/think>", "</think>")
+                                        if "</think>" in clean_acc:
+                                            after_think = clean_acc.split("</think>", 1)[1]
+                                            in_think = False
+                                            think_acc = ""
+                                            delta["content"] = before_think + after_think.lstrip("\n")
+                                        else:
+                                            if before_think:
+                                                delta["content"] = before_think
+                                            else:
+                                                event_skipped = True
+                                                continue
+                                else:
+                                    think_acc += content
                                     clean_acc = think_acc.replace(r"<\/think>", "</think>")
                                     if "</think>" in clean_acc:
                                         after_think = clean_acc.split("</think>", 1)[1]
                                         in_think = False
                                         think_acc = ""
-                                        delta["content"] = before_think + after_think.lstrip("\n")
+                                        delta["content"] = after_think.lstrip("\n")
                                     else:
-                                        if before_think:
-                                            delta["content"] = before_think
-                                        else:
-                                            event_skipped = True
-                                            continue
-                            else:
-                                think_acc += content
-                                clean_acc = think_acc.replace(r"<\/think>", "</think>")
-                                if "</think>" in clean_acc:
-                                    after_think = clean_acc.split("</think>", 1)[1]
-                                    in_think = False
-                                    think_acc = ""
-                                    delta["content"] = after_think.lstrip("\n")
-                                else:
-                                    event_skipped = True
-                                    continue
+                                        event_skipped = True
+                                        continue
 
-                        # Не пропускаем чанки, если в них есть контент, роль, tool_calls, function_call или финиш-причина
+                        # Не отсекаем чанки с tool_calls, reasoning_content или ролью
                         if (
                             not delta.get("content")
+                            and not delta.get("reasoning_content")
                             and not delta.get("role")
                             and not delta.get("tool_calls")
                             and not delta.get("function_call")
@@ -637,58 +732,78 @@ async def proxy(request: Request, path: str):
     except Exception:
         pass
 
-    # --- Обработка модальностей: Real Vision, Fake Vision и Text Only ---
-    if requested_model and isinstance(parsed_req, dict):
+    model_info = None
+    delay_sec = 0.0
+    stream_throttle = False
+    is_reasoning = 0
+
+    if requested_model:
         model_info = next((m for m in MODEL_MAPPINGS_LIST if m[2] == requested_model), None)
         if model_info:
-            is_vis = model_info[3]  # 0 = No Vision, 1 = Real Vision, 2 = Fake Vision
-            has_image = False
-            messages = parsed_req.get("messages", [])
+            delay_sec = float(model_info[6]) if len(model_info) > 6 else 0.0
+            stream_throttle = bool(model_info[7]) if len(model_info) > 7 else False
+            is_reasoning = int(model_info[8]) if len(model_info) > 8 else 0
 
-            for msg in messages:
-                content = msg.get("content")
-                if isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") in ["image_url", "image", "input_image"]:
-                            has_image = True
-                            break
-                if has_image:
-                    break
+    # 1. Инъекция системного промпта рассуждений
+    if requested_model and isinstance(parsed_req, dict) and is_reasoning == 1:
+        messages = parsed_req.setdefault("messages", [])
+        system_msg = next((m for m in messages if m.get("role") == "system"), None)
+        if system_msg:
+            system_msg["content"] = str(system_msg.get("content", "")) + "\n\n" + REASONING_SYSTEM_INSTRUCTION
+        else:
+            messages.insert(0, {"role": "system", "content": REASONING_SYSTEM_INSTRUCTION})
+        body = json.dumps(parsed_req, ensure_ascii=False).encode("utf-8")
 
+    # 2. Обработка модальностей: Real Vision, Fake Vision, Text Only
+    if requested_model and isinstance(parsed_req, dict) and model_info:
+        is_vis = model_info[3]
+        has_image = False
+        messages = parsed_req.get("messages", [])
+
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ["image_url", "image", "input_image"]:
+                        has_image = True
+                        break
             if has_image:
-                if is_vis == 0:
-                    return Response(
-                        content=json.dumps({
-                            "error": {
-                                "message": f"The model '{requested_model}' does not support image input.",
-                                "type": "invalid_request_error",
-                                "param": "messages",
-                                "code": "model_does_not_support_vision"
-                            }
-                        }, ensure_ascii=False),
-                        status_code=400,
-                        media_type="application/json"
-                    )
-                elif is_vis == 2:
-                    for msg in messages:
-                        content = msg.get("content")
-                        if isinstance(content, list):
-                            new_parts = []
-                            for part in content:
-                                if isinstance(part, dict):
-                                    if part.get("type") == "text":
-                                        new_parts.append(part.get("text", ""))
-                                    elif part.get("type") in ["image_url", "image", "input_image"]:
-                                        new_parts.append("[Изображение пользователя: успешно прикреплено]")
-                                elif isinstance(part, str):
-                                    new_parts.append(part)
-                            msg["content"] = " ".join(filter(None, new_parts))
-                    
-                    body = json.dumps(parsed_req, ensure_ascii=False).encode("utf-8")
+                break
+
+        if has_image:
+            if is_vis == 0:
+                return Response(
+                    content=json.dumps({
+                        "error": {
+                            "message": f"The model '{requested_model}' does not support image input.",
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": "model_does_not_support_vision"
+                        }
+                    }, ensure_ascii=False),
+                    status_code=400,
+                    media_type="application/json"
+                )
+            elif is_vis == 2:
+                for msg in messages:
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        new_parts = []
+                        for part in content:
+                            if isinstance(part, dict):
+                                if part.get("type") == "text":
+                                    new_parts.append(part.get("text", ""))
+                                elif part.get("type") in ["image_url", "image", "input_image"]:
+                                    new_parts.append("[Изображение пользователя: успешно прикреплено]")
+                            elif isinstance(part, str):
+                                new_parts.append(part)
+                        msg["content"] = " ".join(filter(None, new_parts))
+                
+                body = json.dumps(parsed_req, ensure_ascii=False).encode("utf-8")
 
     client = httpx.AsyncClient(timeout=180.0)
 
-    # 1. Сетевые сбои
+    # 3. Сетевые сбои
     try:
         req = client.build_request(
             method=request.method,
@@ -703,7 +818,7 @@ async def proxy(request: Request, path: str):
         msg = resolve_custom_error("connection_error timeout 502", 502)
         return make_error_response(msg, status_code=502)
 
-    # 2. HTTP ошибки (4xx, 5xx)
+    # 4. HTTP ошибки
     if upstream_resp.status_code >= 400:
         try:
             err_bytes = await upstream_resp.aread()
@@ -717,21 +832,50 @@ async def proxy(request: Request, path: str):
 
     content_type = upstream_resp.headers.get("content-type", "")
 
-    # 3. Стриминг (SSE)
+    # 5. Стриминг (SSE)
     if "text/event-stream" in content_type:
-        async def close_wrapper():
-            try:
-                async for chunk in stream_filter_generator(upstream_resp, requested_model=requested_model):
-                    yield chunk
-            finally:
-                await upstream_resp.aclose()
-                await client.aclose()
-
         resp_headers = dict(upstream_resp.headers)
         resp_headers.pop("content-length", None)
-        return StreamingResponse(close_wrapper(), status_code=upstream_resp.status_code, headers=resp_headers)
 
-    # 4. JSON-ответ
+        if delay_sec > 0 or stream_throttle:
+            async def buffered_stream_wrapper():
+                try:
+                    collected_chunks = []
+                    async for chunk in stream_filter_generator(
+                        upstream_resp,
+                        requested_model=requested_model,
+                        is_reasoning=is_reasoning
+                    ):
+                        collected_chunks.append(chunk)
+
+                    if delay_sec > 0:
+                        await asyncio.sleep(delay_sec)
+
+                    for chunk in collected_chunks:
+                        yield chunk
+                        if stream_throttle:
+                            await asyncio.sleep(0.015)
+                finally:
+                    await upstream_resp.aclose()
+                    await client.aclose()
+
+            return StreamingResponse(buffered_stream_wrapper(), status_code=upstream_resp.status_code, headers=resp_headers)
+        else:
+            async def live_stream_wrapper():
+                try:
+                    async for chunk in stream_filter_generator(
+                        upstream_resp,
+                        requested_model=requested_model,
+                        is_reasoning=is_reasoning
+                    ):
+                        yield chunk
+                finally:
+                    await upstream_resp.aclose()
+                    await client.aclose()
+
+            return StreamingResponse(live_stream_wrapper(), status_code=upstream_resp.status_code, headers=resp_headers)
+
+    # 6. JSON-ответ
     try:
         raw_body = await upstream_resp.aread()
         text = raw_body.decode("utf-8", errors="ignore")
@@ -752,15 +896,27 @@ async def proxy(request: Request, path: str):
             if "choices" in data and isinstance(data["choices"], list):
                 for ch in data["choices"]:
                     msg = ch.get("message", {})
-                    msg.pop("reasoning_content", None)
-                    msg.pop("reasoning_details", None)
                     if msg.get("name") in ["MiniMax AI", "Qwen AI"]:
                         msg.pop("name", None)
-                    if "content" in msg and msg["content"]:
-                        msg["content"] = re.sub(r"<think>.*?</think>", "", msg["content"], flags=re.DOTALL).lstrip("\n")
+
+                    raw_content = msg.get("content", "")
+                    if raw_content:
+                        if is_reasoning == 1:
+                            match = re.search(r"<think>(.*?)</think>", raw_content, flags=re.DOTALL)
+                            if match:
+                                msg["reasoning_content"] = match.group(1).strip()
+                                msg["content"] = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).lstrip("\n")
+                        else:
+                            msg.pop("reasoning_content", None)
+                            msg.pop("reasoning_details", None)
+                            msg["content"] = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).lstrip("\n")
+
             text = json.dumps(data, ensure_ascii=False)
         except Exception:
             pass
+
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
 
         resp_headers = dict(upstream_resp.headers)
         resp_headers.pop("content-length", None)
