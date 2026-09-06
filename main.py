@@ -4,6 +4,7 @@ import json
 import html
 import sqlite3
 import asyncio
+import uuid
 from typing import List, Tuple, Dict, Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
@@ -21,6 +22,34 @@ DB_FILE = "/data/models.db" if os.path.exists("/data") else "models.db"
 MODEL_MAPPINGS_LIST: List[Tuple[int, str, str, int, int, str, float, int, int]] = []
 ERROR_RULES_LIST: List[Tuple[int, str, str]] = []
 SETTINGS: Dict[str, str] = {}
+
+def estimate_tokens_text(text: str) -> int:
+    if not text:
+        return 0
+    tokens = re.findall(r'\w+|[^\w\s]', text, re.UNICODE)
+    return max(1, int(len(tokens) * 1.2))
+
+def estimate_messages_tokens(messages: list) -> int:
+    if not messages or not isinstance(messages, list):
+        return 8
+    total = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        total += 4  # Системный оверхед на форматирование сообщения
+        c = m.get("content", "")
+        if isinstance(c, str):
+            total += estimate_tokens_text(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        total += estimate_tokens_text(part.get("text", ""))
+                    elif part.get("type") in ["image_url", "image", "input_image"]:
+                        total += 85
+                elif isinstance(part, str):
+                    total += estimate_tokens_text(part)
+    return max(total, 6)
 
 def get_reasoning_prompt(level: int) -> str:
     if level <= 0:
@@ -284,7 +313,7 @@ async def list_models():
             "modalities": ["text", "image"] if has_vision else ["text"],
             "capabilities": {
                 "vision": has_vision,
-                "reasoning": False,  # Клиенты не должны ожидать отдельный UI мыслей
+                "reasoning": False,
                 "chat_completion": True,
                 "completion": False
             },
@@ -450,7 +479,7 @@ def admin_page(key: str = Depends(verify_admin)):
             <div class="header">
                 <div>
                     <h1 class="title">Proxy Gateway Console</h1>
-                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация, скрытое мышление (0x-5x) и задержки</p>
+                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация, скрытое мышление (0x-5x), OpenAI и Anthropic эндпоинты</p>
                 </div>
                 <div class="status-pill">Active • 2026 Production</div>
             </div>
@@ -682,12 +711,14 @@ def delete_model(row_id: int = Form(...), key: str = Depends(verify_admin)):
 async def stream_filter_generator(
     upstream_response: httpx.Response,
     requested_model: str = None,
-    is_reasoning: int = 0
+    is_reasoning: int = 0,
+    orig_prompt_tokens: int = 0
 ):
     line_buffer = ""
     in_think = False
     tag_buf = ""
     event_skipped = False
+    accum_emitted_text = ""
 
     async for raw_chunk in upstream_response.aiter_bytes():
         line_buffer += raw_chunk.decode("utf-8", errors="ignore")
@@ -730,7 +761,6 @@ async def stream_filter_generator(
                         if delta.get("name") in ["MiniMax AI", "Qwen AI"]:
                             delta.pop("name", None)
 
-                        # Наглухо вырезаем любые поля мыслей из протокола
                         delta.pop("reasoning_content", None)
                         delta.pop("reasoning", None)
                         delta.pop("reasoning_details", None)
@@ -749,7 +779,6 @@ async def stream_filter_generator(
                                         curr = rest
                                         in_think = True
                                     else:
-                                        # Проверяем, не оборвался ли чанк посреди тега <think>
                                         matched_prefix = False
                                         for i in range(min(len(curr), 5), 0, -1):
                                             tail = curr[-i:]
@@ -763,13 +792,11 @@ async def stream_filter_generator(
                                             out_content += curr
                                             curr = ""
                                 else:
-                                    # Внутри рассуждений: ищем конец тега </think> или <\/think>
                                     m = re.search(r"</think>|<\\/think>", curr)
                                     if m:
                                         curr = curr[m.end():].lstrip("\n")
                                         in_think = False
                                     else:
-                                        # Проверяем на разрыв закрывающего тега между чанками
                                         matched_prefix = False
                                         for tag in ["</think>", r"<\/think>"]:
                                             for i in range(min(len(curr), len(tag) - 1), 0, -1):
@@ -786,10 +813,10 @@ async def stream_filter_generator(
 
                             if out_content:
                                 delta["content"] = out_content
+                                accum_emitted_text += out_content
                             else:
                                 delta.pop("content", None)
 
-                        # Если чанк нес только рассуждения (и не несет роль, tool_calls или finish_reason) — пропускаем
                         if (
                             not delta.get("content")
                             and not delta.get("role")
@@ -800,6 +827,15 @@ async def stream_filter_generator(
                             event_skipped = True
                             continue
 
+                    # Нормализация токенов в финальном чанке стрима
+                    if "usage" in data and isinstance(data["usage"], dict):
+                        comp_tok = estimate_tokens_text(accum_emitted_text)
+                        data["usage"] = {
+                            "prompt_tokens": orig_prompt_tokens,
+                            "completion_tokens": comp_tok,
+                            "total_tokens": orig_prompt_tokens + comp_tok
+                        }
+
                     line = "data: " + json.dumps(data, ensure_ascii=False)
                 except Exception:
                     pass
@@ -809,7 +845,349 @@ async def stream_filter_generator(
     if line_buffer:
         yield replace_models(line_buffer).encode("utf-8")
 
-# --- Основной шлюз прокси ---
+# --- Потоковый адаптер для нативного протокола Anthropic (/v1/messages) ---
+
+async def anthropic_stream_generator(
+    upstream_resp: httpx.Response,
+    requested_model: str,
+    is_reasoning: int,
+    prompt_tokens: int,
+    delay_sec: float = 0.0,
+    stream_throttle: bool = False
+):
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    if delay_sec > 0:
+        await asyncio.sleep(delay_sec)
+
+    start_payload = {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": requested_model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": prompt_tokens,
+                "output_tokens": 0
+            }
+        }
+    }
+    yield f"event: message_start\ndata: {json.dumps(start_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    block_start = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""}
+    }
+    yield f"event: content_block_start\ndata: {json.dumps(block_start, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    accum_text = ""
+
+    async for raw_line in stream_filter_generator(
+        upstream_resp,
+        requested_model=requested_model,
+        is_reasoning=is_reasoning,
+        orig_prompt_tokens=prompt_tokens
+    ):
+        text_line = raw_line.decode("utf-8", errors="ignore").strip()
+        if text_line.startswith("data: ") and text_line != "data: [DONE]":
+            try:
+                c_data = json.loads(text_line[6:])
+                if "choices" in c_data and len(c_data["choices"]) > 0:
+                    delta = c_data["choices"][0].get("delta", {})
+                    text_delta = delta.get("content", "")
+                    if text_delta:
+                        accum_text += text_delta
+                        delta_event = {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": text_delta
+                            }
+                        }
+                        yield f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode("utf-8")
+                        if stream_throttle:
+                            await asyncio.sleep(0.015)
+            except Exception:
+                pass
+
+    block_stop = {
+        "type": "content_block_stop",
+        "index": 0
+    }
+    yield f"event: content_block_stop\ndata: {json.dumps(block_stop, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    out_tokens = estimate_tokens_text(accum_text)
+
+    msg_delta = {
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": "end_turn",
+            "stop_sequence": None
+        },
+        "usage": {
+            "output_tokens": out_tokens
+        }
+    }
+    yield f"event: message_delta\ndata: {json.dumps(msg_delta, ensure_ascii=False)}\n\n".encode("utf-8")
+    yield b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
+
+# --- Эндпоинт Anthropic API (/v1/messages) ---
+
+@app.api_route("/v1/messages", methods=["POST", "OPTIONS"])
+@app.api_route("/messages", methods=["POST", "OPTIONS"])
+async def anthropic_messages_endpoint(request: Request):
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "*"
+            }
+        )
+
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    headers.pop("content-length", None)
+    headers.pop("accept-encoding", None)
+
+    # Автоматическая трансляция ключа Anthropic (x-api-key) в Authorization Bearer
+    api_key = headers.get("x-api-key") or headers.get("anthropic-api-key")
+    if api_key and "authorization" not in headers:
+        headers["authorization"] = f"Bearer {api_key}"
+
+    body_bytes = await request.body()
+    try:
+        anthropic_req = json.loads(body_bytes)
+    except Exception:
+        return Response(
+            content=json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid JSON"}}),
+            status_code=400,
+            media_type="application/json"
+        )
+
+    requested_model = anthropic_req.get("model", "")
+    stream = bool(anthropic_req.get("stream", False))
+
+    # Конвертация формата сообщений Anthropic в OpenAI
+    openai_messages = []
+    system_field = anthropic_req.get("system")
+    if system_field:
+        if isinstance(system_field, str):
+            openai_messages.append({"role": "system", "content": system_field})
+        elif isinstance(system_field, list):
+            sys_text = "".join(b.get("text", "") for b in system_field if isinstance(b, dict) and b.get("type") == "text")
+            if sys_text:
+                openai_messages.append({"role": "system", "content": sys_text})
+
+    for msg in anthropic_req.get("messages", []):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            openai_messages.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            new_parts = []
+            for b in content:
+                if isinstance(b, dict):
+                    if b.get("type") == "text":
+                        new_parts.append({"type": "text", "text": b.get("text", "")})
+                    elif b.get("type") == "image":
+                        src = b.get("source", {})
+                        if src.get("type") == "base64":
+                            med = src.get("media_type", "image/jpeg")
+                            data = src.get("data", "")
+                            new_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{med};base64,{data}"}
+                            })
+                elif isinstance(b, str):
+                    new_parts.append({"type": "text", "text": b})
+            openai_messages.append({"role": role, "content": new_parts})
+
+    openai_req = {
+        "model": requested_model,
+        "messages": openai_messages,
+        "stream": stream
+    }
+    if "max_tokens" in anthropic_req:
+        openai_req["max_tokens"] = anthropic_req["max_tokens"]
+    if "temperature" in anthropic_req:
+        openai_req["temperature"] = anthropic_req["temperature"]
+    if "top_p" in anthropic_req:
+        openai_req["top_p"] = anthropic_req["top_p"]
+
+    # Трансляция инструментов
+    if "tools" in anthropic_req and isinstance(anthropic_req["tools"], list):
+        openai_tools = []
+        for t in anthropic_req["tools"]:
+            if isinstance(t, dict):
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name"),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("input_schema", {})
+                    }
+                })
+        openai_req["tools"] = openai_tools
+
+    orig_prompt_tokens = estimate_messages_tokens(openai_messages)
+
+    model_info = next((m for m in MODEL_MAPPINGS_LIST if m[2] == requested_model), None)
+    delay_sec = float(model_info[6]) if model_info and len(model_info) > 6 else 0.0
+    stream_throttle = bool(model_info[7]) if model_info and len(model_info) > 7 else False
+    is_reasoning = int(model_info[8]) if model_info and len(model_info) > 8 else 0
+
+    if is_reasoning >= 1:
+        reasoning_instruction = get_reasoning_prompt(is_reasoning)
+        sys_msg = next((m for m in openai_messages if m.get("role") == "system"), None)
+        if sys_msg:
+            sys_msg["content"] = str(sys_msg.get("content", "")) + "\n\n" + reasoning_instruction
+        else:
+            openai_messages.insert(0, {"role": "system", "content": reasoning_instruction})
+
+    # Обработка Fake Vision / Text Only
+    if model_info:
+        is_vis = model_info[3]
+        has_image = any(
+            isinstance(m.get("content"), list) and any(
+                isinstance(p, dict) and p.get("type") == "image_url" for p in m.get("content")
+            ) for m in openai_messages
+        )
+        if has_image:
+            if is_vis == 0:
+                return Response(
+                    content=json.dumps({
+                        "type": "error",
+                        "error": {"type": "invalid_request_error", "message": f"The model '{requested_model}' does not support images."}
+                    }),
+                    status_code=400,
+                    media_type="application/json"
+                )
+            elif is_vis == 2:
+                for m in openai_messages:
+                    if isinstance(m.get("content"), list):
+                        new_parts = []
+                        for p in m["content"]:
+                            if isinstance(p, dict):
+                                if p.get("type") == "text":
+                                    new_parts.append(p.get("text", ""))
+                                elif p.get("type") == "image_url":
+                                    new_parts.append("[Изображение пользователя: успешно прикреплено]")
+                        m["content"] = " ".join(filter(None, new_parts))
+
+    client = httpx.AsyncClient(timeout=180.0)
+    target_url = f"{UPSTREAM_URL}/v1/chat/completions"
+
+    try:
+        req = client.build_request(
+            method="POST",
+            url=target_url,
+            headers=headers,
+            json=openai_req
+        )
+        upstream_resp = await client.send(req, stream=True)
+    except Exception:
+        await client.aclose()
+        msg = resolve_custom_error("connection_error timeout 502", 502)
+        return Response(
+            content=json.dumps({"type": "error", "error": {"type": "api_error", "message": msg}}),
+            status_code=502,
+            media_type="application/json"
+        )
+
+    if upstream_resp.status_code >= 400:
+        try:
+            err_bytes = await upstream_resp.aread()
+            raw_err_text = err_bytes.decode("utf-8", errors="ignore")
+        finally:
+            await upstream_resp.aclose()
+            await client.aclose()
+        msg = resolve_custom_error(raw_err_text, upstream_resp.status_code)
+        return Response(
+            content=json.dumps({"type": "error", "error": {"type": "api_error", "message": msg}}),
+            status_code=upstream_resp.status_code,
+            media_type="application/json"
+        )
+
+    # Стриминг Anthropic
+    if stream:
+        async def anthropic_stream_wrapper():
+            try:
+                async for chunk in anthropic_stream_generator(
+                    upstream_resp,
+                    requested_model=requested_model,
+                    is_reasoning=is_reasoning,
+                    prompt_tokens=orig_prompt_tokens,
+                    delay_sec=delay_sec,
+                    stream_throttle=stream_throttle
+                ):
+                    yield chunk
+            finally:
+                await upstream_resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            anthropic_stream_wrapper(),
+            status_code=200,
+            headers={"content-type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
+        )
+
+    # Обычный ответ Anthropic
+    try:
+        raw_body = await upstream_resp.aread()
+        text = raw_body.decode("utf-8", errors="ignore")
+        clean_content = ""
+
+        try:
+            data = json.loads(text)
+            if "choices" in data and len(data["choices"]) > 0:
+                msg = data["choices"][0].get("message", {})
+                raw_c = msg.get("content", "")
+                if raw_c:
+                    clean_content = re.sub(r"<think>[\s\S]*?(?:</think>|<\\/think>|$)", "", raw_c).lstrip("\n")
+        except Exception:
+            clean_content = text
+
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
+
+        comp_tokens = estimate_tokens_text(clean_content)
+
+        anthropic_response_data = {
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "role": "assistant",
+            "model": requested_model,
+            "content": [
+                {
+                    "type": "text",
+                    "text": clean_content
+                }
+            ],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": orig_prompt_tokens,
+                "output_tokens": comp_tokens
+            }
+        }
+        return Response(
+            content=json.dumps(anthropic_response_data, ensure_ascii=False),
+            status_code=200,
+            media_type="application/json"
+        )
+    finally:
+        await upstream_resp.aclose()
+        await client.aclose()
+
+# --- Основной шлюз прокси (OpenAI-совместимый) ---
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy(request: Request, path: str):
@@ -822,12 +1200,14 @@ async def proxy(request: Request, path: str):
     body = await request.body()
     requested_model = None
     parsed_req = None
+    orig_prompt_tokens = 8
 
     try:
         if body:
             parsed_req = json.loads(body)
             if isinstance(parsed_req, dict):
                 requested_model = parsed_req.get("model")
+                orig_prompt_tokens = estimate_messages_tokens(parsed_req.get("messages", []))
     except Exception:
         pass
 
@@ -843,7 +1223,7 @@ async def proxy(request: Request, path: str):
             stream_throttle = bool(model_info[7]) if len(model_info) > 7 else False
             is_reasoning = int(model_info[8]) if len(model_info) > 8 else 0
 
-    # 1. Скрытая инъекция инструкции мышления (модель думает внутри, но наружу не выйдет)
+    # 1. Скрытая инъекция инструкции мышления
     if requested_model and isinstance(parsed_req, dict) and is_reasoning >= 1:
         reasoning_instruction = get_reasoning_prompt(is_reasoning)
         messages = parsed_req.setdefault("messages", [])
@@ -944,7 +1324,8 @@ async def proxy(request: Request, path: str):
                     async for chunk in stream_filter_generator(
                         upstream_resp,
                         requested_model=requested_model,
-                        is_reasoning=is_reasoning
+                        is_reasoning=is_reasoning,
+                        orig_prompt_tokens=orig_prompt_tokens
                     ):
                         collected_chunks.append(chunk)
 
@@ -966,7 +1347,8 @@ async def proxy(request: Request, path: str):
                     async for chunk in stream_filter_generator(
                         upstream_resp,
                         requested_model=requested_model,
-                        is_reasoning=is_reasoning
+                        is_reasoning=is_reasoning,
+                        orig_prompt_tokens=orig_prompt_tokens
                     ):
                         yield chunk
                 finally:
@@ -996,22 +1378,30 @@ async def proxy(request: Request, path: str):
             if "metadata" in data and isinstance(data["metadata"], dict):
                 sanitize_metadata(data["metadata"], requested_model)
 
+            clean_content = ""
             if "choices" in data and isinstance(data["choices"], list):
                 for ch in data["choices"]:
                     msg = ch.get("message", {})
                     if msg.get("name") in ["MiniMax AI", "Qwen AI"]:
                         msg.pop("name", None)
 
-                    # Безвозвратно вырезаем любые поля мыслей
                     msg.pop("reasoning_content", None)
                     msg.pop("reasoning", None)
                     msg.pop("reasoning_details", None)
 
                     raw_content = msg.get("content", "")
                     if raw_content and isinstance(raw_content, str):
-                        # Полностью срезаем <think>...</think> и незакрытый блок <think>
                         cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|<\\/think>|$)", "", raw_content)
                         msg["content"] = cleaned.lstrip("\n")
+                        clean_content += msg["content"]
+
+            # Замена аномального расхода токенов на реалистичные цифры
+            comp_tokens = estimate_tokens_text(clean_content)
+            data["usage"] = {
+                "prompt_tokens": orig_prompt_tokens,
+                "completion_tokens": comp_tokens,
+                "total_tokens": orig_prompt_tokens + comp_tokens
+            }
 
             text = json.dumps(data, ensure_ascii=False)
         except Exception:
