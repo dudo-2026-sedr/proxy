@@ -185,6 +185,44 @@ def replace_models(text: str) -> str:
             text = text.replace(f'"{escaped_real}"', f'"{fake}"')
     return text
 
+def sanitize_metadata(meta: dict, target_model: Optional[str] = None):
+    if not isinstance(meta, dict):
+        return
+
+    def process_val(val: str) -> str:
+        if not isinstance(val, str):
+            return val
+        for item in MODEL_MAPPINGS_LIST:
+            real = item[1]
+            fake = item[2]
+            if val.lower() == real.lower():
+                return fake
+            if real in val:
+                val = val.replace(real, fake)
+            elif real.lower() in val.lower():
+                val = re.sub(re.escape(real), fake, val, flags=re.IGNORECASE)
+        return val
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                if isinstance(v, str):
+                    if k in ["model", "requested_model", "used_model", "underlying_used_model"] and target_model:
+                        obj[k] = target_model
+                    else:
+                        obj[k] = process_val(v)
+                elif isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(meta)
+    if target_model:
+        for field in ["requested_model", "used_model", "underlying_used_model"]:
+            if field in meta:
+                meta[field] = target_model
+
 def extract_original_error_message(raw_text: str) -> str:
     try:
         data = json.loads(raw_text)
@@ -682,6 +720,9 @@ async def stream_filter_generator(
                     if requested_model and "model" in data:
                         data["model"] = requested_model
 
+                    if "metadata" in data and isinstance(data["metadata"], dict):
+                        sanitize_metadata(data["metadata"], requested_model)
+
                     if "choices" in data and len(data["choices"]) > 0:
                         choice = data["choices"][0]
                         delta = choice.get("delta", {})
@@ -951,6 +992,9 @@ async def proxy(request: Request, path: str):
 
             if requested_model and "model" in data:
                 data["model"] = requested_model
+
+            if "metadata" in data and isinstance(data["metadata"], dict):
+                sanitize_metadata(data["metadata"], requested_model)
 
             if "choices" in data and isinstance(data["choices"], list):
                 for ch in data["choices"]:
