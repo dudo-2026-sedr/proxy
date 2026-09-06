@@ -246,7 +246,7 @@ async def list_models():
             "modalities": ["text", "image"] if has_vision else ["text"],
             "capabilities": {
                 "vision": has_vision,
-                "reasoning": bool(is_reas > 0),
+                "reasoning": False,  # Клиенты не должны ожидать отдельный UI мыслей
                 "chat_completion": True,
                 "completion": False
             },
@@ -283,7 +283,7 @@ def admin_page(key: str = Depends(verify_admin)):
         if is_reas == 0:
             reasoning_badge = "<span style='color:var(--muted); font-size:12px;'>Нет (0x)</span>"
         elif is_reas == 1:
-            reasoning_badge = "<span class='badge badge-reasoning'>1x</span>"
+            reasoning_badge = "<span class='badge badge-reasoning'>1x (Скрыто)</span>"
         elif is_reas == 2:
             reasoning_badge = "<span class='badge badge-reasoning'>2x (1 пров.)</span>"
         elif is_reas == 3:
@@ -412,7 +412,7 @@ def admin_page(key: str = Depends(verify_admin)):
             <div class="header">
                 <div>
                     <h1 class="title">Proxy Gateway Console</h1>
-                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация, мышление (0x-5x) и задержки</p>
+                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация, скрытое мышление (0x-5x) и задержки</p>
                 </div>
                 <div class="status-pill">Active • 2026 Production</div>
             </div>
@@ -442,7 +442,7 @@ def admin_page(key: str = Depends(verify_admin)):
 
             <div class="card">
                 <div class="card-header">
-                    <div class="card-title">3. Модели: Vision, Рассуждения (0x - 5x) и Задержка</div>
+                    <div class="card-title">3. Модели: Vision, Скрытое рассуждение (0x - 5x) и Задержка</div>
                     <button type="button" onclick="openAddModal()">+ Добавить модель</button>
                 </div>
                 <div class="table-responsive">
@@ -483,10 +483,10 @@ def admin_page(key: str = Depends(verify_admin)):
                             </select>
                         </div>
                         <div class="form-group" style="flex: 1;">
-                            <label>Мышление / Рассуждения</label>
+                            <label>Мышление (Всегда скрыто от клиента)</label>
                             <select name="is_reasoning" id="modal_is_reasoning">
-                                <option value="0">0x: Нет мышления (Вырезать)</option>
-                                <option value="1">1x: Мышление (Без анализа промпта)</option>
+                                <option value="0">0x: Без мышления</option>
+                                <option value="1">1x: Мышление (1 проход)</option>
                                 <option value="2">2x: Мышление (Перепроверка 1 раз)</option>
                                 <option value="3">3x: Мышление (Перепроверка 2 раза)</option>
                                 <option value="4">4x: Мышление (Глубокий аудит)</option>
@@ -639,7 +639,7 @@ def delete_model(row_id: int = Form(...), key: str = Depends(verify_admin)):
     load_data()
     return HTMLResponse(f"<script>location.href='/admin?key={key}';</script>")
 
-# --- Потоковый генератор с обработкой рассуждений и tool_calls ---
+# --- Потоковый генератор с гарантированным вырезанием рассуждений ---
 
 async def stream_filter_generator(
     upstream_response: httpx.Response,
@@ -648,7 +648,7 @@ async def stream_filter_generator(
 ):
     line_buffer = ""
     in_think = False
-    think_acc = ""
+    tag_buf = ""
     event_skipped = False
 
     async for raw_chunk in upstream_response.aiter_bytes():
@@ -689,74 +689,68 @@ async def stream_filter_generator(
                         if delta.get("name") in ["MiniMax AI", "Qwen AI"]:
                             delta.pop("name", None)
 
+                        # Наглухо вырезаем любые поля мыслей из протокола
+                        delta.pop("reasoning_content", None)
+                        delta.pop("reasoning", None)
+                        delta.pop("reasoning_details", None)
+
                         content = delta.get("content", "")
+                        if content:
+                            curr = tag_buf + content
+                            tag_buf = ""
+                            out_content = ""
 
-                        if is_reasoning >= 1:
-                            if content:
+                            while curr:
                                 if not in_think:
-                                    if "<think>" in content:
+                                    if "<think>" in curr:
+                                        before, rest = curr.split("<think>", 1)
+                                        out_content += before
+                                        curr = rest
                                         in_think = True
-                                        parts = content.split("<think>", 1)
-                                        before = parts[0]
-                                        after = parts[1]
-                                        if "</think>" in after:
-                                            t_part, c_part = after.split("</think>", 1)
-                                            in_think = False
-                                            delta["reasoning_content"] = t_part
-                                            delta["content"] = before + c_part.lstrip("\n")
-                                        else:
-                                            delta["reasoning_content"] = after
-                                            delta["content"] = before if before else ""
-                                            if not before:
-                                                delta.pop("content", None)
-                                else:
-                                    if "</think>" in content:
-                                        in_think = False
-                                        t_part, c_part = content.split("</think>", 1)
-                                        delta["reasoning_content"] = t_part
-                                        delta["content"] = c_part.lstrip("\n")
                                     else:
-                                        delta["reasoning_content"] = content
-                                        delta.pop("content", None)
-                        else:
-                            # Режим 0x: Полное вырезание блока think
-                            delta.pop("reasoning_content", None)
-                            delta.pop("reasoning_details", None)
-                            if content:
-                                if not in_think:
-                                    if "<think>" in content:
-                                        in_think = True
-                                        parts = content.split("<think>", 1)
-                                        before_think = parts[0]
-                                        think_acc = parts[1]
-                                        clean_acc = think_acc.replace(r"<\/think>", "</think>")
-                                        if "</think>" in clean_acc:
-                                            after_think = clean_acc.split("</think>", 1)[1]
-                                            in_think = False
-                                            think_acc = ""
-                                            delta["content"] = before_think + after_think.lstrip("\n")
-                                        else:
-                                            if before_think:
-                                                delta["content"] = before_think
-                                            else:
-                                                event_skipped = True
-                                                continue
+                                        # Проверяем, не оборвался ли чанк посреди тега <think>
+                                        matched_prefix = False
+                                        for i in range(min(len(curr), 5), 0, -1):
+                                            tail = curr[-i:]
+                                            if "<think>".startswith(tail):
+                                                out_content += curr[:-i]
+                                                tag_buf = tail
+                                                curr = ""
+                                                matched_prefix = True
+                                                break
+                                        if not matched_prefix:
+                                            out_content += curr
+                                            curr = ""
                                 else:
-                                    think_acc += content
-                                    clean_acc = think_acc.replace(r"<\/think>", "</think>")
-                                    if "</think>" in clean_acc:
-                                        after_think = clean_acc.split("</think>", 1)[1]
+                                    # Внутри рассуждений: ищем конец тега </think> или <\/think>
+                                    m = re.search(r"</think>|<\\/think>", curr)
+                                    if m:
+                                        curr = curr[m.end():].lstrip("\n")
                                         in_think = False
-                                        think_acc = ""
-                                        delta["content"] = after_think.lstrip("\n")
                                     else:
-                                        event_skipped = True
-                                        continue
+                                        # Проверяем на разрыв закрывающего тега между чанками
+                                        matched_prefix = False
+                                        for tag in ["</think>", r"<\/think>"]:
+                                            for i in range(min(len(curr), len(tag) - 1), 0, -1):
+                                                tail = curr[-i:]
+                                                if tag.startswith(tail):
+                                                    tag_buf = tail
+                                                    curr = ""
+                                                    matched_prefix = True
+                                                    break
+                                            if matched_prefix:
+                                                break
+                                        if not matched_prefix:
+                                            curr = ""
 
-                        # Не отсекаем чанки с tool_calls, reasoning_content или ролью
+                            if out_content:
+                                delta["content"] = out_content
+                            else:
+                                delta.pop("content", None)
+
+                        # Если чанк нес только рассуждения (и не несет роль, tool_calls или finish_reason) — пропускаем
                         if (
                             not delta.get("content")
-                            and not delta.get("reasoning_content")
                             and not delta.get("role")
                             and not delta.get("tool_calls")
                             and not delta.get("function_call")
@@ -782,6 +776,7 @@ async def proxy(request: Request, path: str):
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
+    headers.pop("accept-encoding", None)
 
     body = await request.body()
     requested_model = None
@@ -807,7 +802,7 @@ async def proxy(request: Request, path: str):
             stream_throttle = bool(model_info[7]) if len(model_info) > 7 else False
             is_reasoning = int(model_info[8]) if len(model_info) > 8 else 0
 
-    # 1. Инъекция системного промпта рассуждений (уровни 1x-5x)
+    # 1. Скрытая инъекция инструкции мышления (модель думает внутри, но наружу не выйдет)
     if requested_model and isinstance(parsed_req, dict) and is_reasoning >= 1:
         reasoning_instruction = get_reasoning_prompt(is_reasoning)
         messages = parsed_req.setdefault("messages", [])
@@ -894,7 +889,7 @@ async def proxy(request: Request, path: str):
         msg = resolve_custom_error(raw_err_text, upstream_resp.status_code)
         return make_error_response(msg, status_code=upstream_resp.status_code)
 
-    content_type = upstream_resp.headers.get("content-type", "")
+    content_type = upstream_resp.headers.get("content-type", "").lower()
 
     # 5. Стриминг (SSE)
     if "text/event-stream" in content_type:
@@ -939,7 +934,7 @@ async def proxy(request: Request, path: str):
 
             return StreamingResponse(live_stream_wrapper(), status_code=upstream_resp.status_code, headers=resp_headers)
 
-    # 6. JSON-ответ
+    # 6. JSON-ответ (Non-streaming)
     try:
         raw_body = await upstream_resp.aread()
         text = raw_body.decode("utf-8", errors="ignore")
@@ -963,17 +958,16 @@ async def proxy(request: Request, path: str):
                     if msg.get("name") in ["MiniMax AI", "Qwen AI"]:
                         msg.pop("name", None)
 
+                    # Безвозвратно вырезаем любые поля мыслей
+                    msg.pop("reasoning_content", None)
+                    msg.pop("reasoning", None)
+                    msg.pop("reasoning_details", None)
+
                     raw_content = msg.get("content", "")
-                    if raw_content:
-                        if is_reasoning >= 1:
-                            match = re.search(r"<think>(.*?)</think>", raw_content, flags=re.DOTALL)
-                            if match:
-                                msg["reasoning_content"] = match.group(1).strip()
-                                msg["content"] = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).lstrip("\n")
-                        else:
-                            msg.pop("reasoning_content", None)
-                            msg.pop("reasoning_details", None)
-                            msg["content"] = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).lstrip("\n")
+                    if raw_content and isinstance(raw_content, str):
+                        # Полностью срезаем <think>...</think> и незакрытый блок <think>
+                        cleaned = re.sub(r"<think>[\s\S]*?(?:</think>|<\\/think>|$)", "", raw_content)
+                        msg["content"] = cleaned.lstrip("\n")
 
             text = json.dumps(data, ensure_ascii=False)
         except Exception:
