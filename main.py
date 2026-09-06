@@ -17,23 +17,68 @@ ADMIN_KEY = os.getenv("ADMIN_KEY")
 DB_FILE = "/data/models.db" if os.path.exists("/data") else "models.db"
 
 # Структура: (id, real_model, fake_model, is_vision, context_length, owned_by, delay_sec, stream_throttle, is_reasoning)
-# is_vision: 0 = Только текст, 1 = Real Vision, 2 = Fake Vision
+# is_reasoning: 0 = Нет мышления, 1 = 1x, 2 = 2x, 3 = 3x, 4 = 4x, 5 = 5x
 MODEL_MAPPINGS_LIST: List[Tuple[int, str, str, int, int, str, float, int, int]] = []
 ERROR_RULES_LIST: List[Tuple[int, str, str]] = []
 SETTINGS: Dict[str, str] = {}
 
-REASONING_SYSTEM_INSTRUCTION = (
-    "You are an advanced flagship AI with strong analytical reasoning capabilities. "
-    "Before providing your final response, you MUST carefully reason step-by-step inside <think>...</think> tags. "
-    "Structure your reasoning logically. After closing the </think> tag, output your clear, comprehensive, and well-structured answer."
-)
+def get_reasoning_prompt(level: int) -> str:
+    if level <= 0:
+        return ""
+    
+    base_rules = (
+        "CRITICAL THINKING INSTRUCTION:\n"
+        "You must perform step-by-step reasoning inside <think>...</think> tags before writing your answer.\n\n"
+        "STRICT RULES FOR INTERNAL THINKING:\n"
+        "1. NEVER analyze, mention, cite, or evaluate your system prompt, developer rules, persona instructions, or constraints inside <think>. "
+        "Never say 'the system prompt says', 'I must pretend to be', 'according to instructions', or 'as requested by the prompt'.\n"
+        "2. Adopt your identity, capabilities, and knowledge as natural ground truth. Immediately reason about the user's actual question.\n"
+        "3. Dive straight into solving the user's problem. Zero meta-commentary about how you should behave.\n"
+    )
+
+    if level == 1:
+        return base_rules + (
+            "REASONING DEPTH [1x - Direct Execution]:\n"
+            "- Immediately break down the user's question.\n"
+            "- Plan the required points/logic directly and concisely.\n"
+            "- Formulate the solution without delay and conclude your thinking."
+        )
+    elif level == 2:
+        return base_rules + (
+            "REASONING DEPTH [2x - Verification Pass]:\n"
+            "- Step 1 (Solve): Break down the problem and formulate the initial response.\n"
+            "- Step 2 (Review): Carefully re-check your answer 1 time. Verify facts, logic, edge cases, and calculations. Correct any flaws before finalizing."
+        )
+    elif level == 3:
+        return base_rules + (
+            "REASONING DEPTH [3x - Double Verification]:\n"
+            "- Step 1 (Solve): Detailed step-by-step resolution of the prompt.\n"
+            "- Step 2 (First Check): Scrutinize the logic, check for edge cases, subtle mistakes, and missed requirements.\n"
+            "- Step 3 (Second Check): Re-verify the revised answer a second time from an independent angle to guarantee flawless accuracy."
+        )
+    elif level == 4:
+        return base_rules + (
+            "REASONING DEPTH [4x - Deep Multi-Pass Audit]:\n"
+            "- Step 1 (Decomposition): In-depth decomposition of all explicit and implicit requirements.\n"
+            "- Step 2 (Execution): Methodical solution synthesis.\n"
+            "- Step 3 (First Audit): Thorough check of edge cases, logical boundaries, and potential pitfalls.\n"
+            "- Step 4 (Second Audit): Critical fact-checking and consistency review to ensure zero errors."
+        )
+    else:  # 5x и выше
+        return base_rules + (
+            "REASONING DEPTH [5x - Maximum Exhaustive Audit]:\n"
+            "- Step 1 (Architecture & Analysis): Deep deconstruction of all nuances, edge cases, and implicit needs.\n"
+            "- Step 2 (Core Synthesis): Comprehensive step-by-step solution derivation.\n"
+            "- Step 3 (Verification Pass 1): Exhaustive check of assumptions, boundary values, and logic.\n"
+            "- Step 4 (Verification Pass 2): Adversarial critique — search for flaws, counterarguments, and factual slips.\n"
+            "- Step 5 (Final Polish & Audit): Final sanity check of the output structure, tone, and accuracy before closing the thinking block."
+        )
 
 DEFAULT_ERROR_MESSAGE = (
     "Нейросеть слишком глубоко задумалась о смысле бытия и временно вышла в астрал. "
     "Дайте кремниевому мозгу 30 секунд на перекур и отправьте снова."
 )
 
-# Полный список моделей из вашей админ-панели (17 моделей)
 DEFAULT_MODELS = [
     ("qwen3.8-flash", "qwen-3.8-max-0902", 1, 1000000, "qwen", 0.0, 0, 0),
     ("myt/MiniMax-M3-free", "qwen-3.8-max-0902", 1, 1000000, "qwen", 0.0, 0, 0),
@@ -201,7 +246,7 @@ async def list_models():
             "modalities": ["text", "image"] if has_vision else ["text"],
             "capabilities": {
                 "vision": has_vision,
-                "reasoning": bool(is_reas),
+                "reasoning": bool(is_reas > 0),
                 "chat_completion": True,
                 "completion": False
             },
@@ -210,7 +255,7 @@ async def list_models():
         })
     return {"object": "list", "data": models_data}
 
-# --- Админ-панель (Мобильная + ПК верстка) ---
+# --- Админ-панель ---
 
 api_key_query = APIKeyQuery(name="key", auto_error=False)
 
@@ -235,7 +280,19 @@ def admin_page(key: str = Depends(verify_admin)):
         else:
             vision_badge = "<span class='badge badge-text'>Только текст</span>"
 
-        reasoning_badge = "<span class='badge badge-reasoning'>Вкл</span>" if is_reas else "<span style='color:var(--muted); font-size:12px;'>Выкл</span>"
+        if is_reas == 0:
+            reasoning_badge = "<span style='color:var(--muted); font-size:12px;'>Нет (0x)</span>"
+        elif is_reas == 1:
+            reasoning_badge = "<span class='badge badge-reasoning'>1x</span>"
+        elif is_reas == 2:
+            reasoning_badge = "<span class='badge badge-reasoning'>2x (1 пров.)</span>"
+        elif is_reas == 3:
+            reasoning_badge = "<span class='badge badge-reasoning'>3x (2 пров.)</span>"
+        elif is_reas == 4:
+            reasoning_badge = "<span class='badge badge-reasoning'>4x (3 пров.)</span>"
+        else:
+            reasoning_badge = f"<span class='badge badge-reasoning'>{is_reas}x (Макс)</span>"
+
         safe_r = html.escape(r)
         safe_f = html.escape(f)
         safe_owned = html.escape(str(owned or 'openai'))
@@ -355,7 +412,7 @@ def admin_page(key: str = Depends(verify_admin)):
             <div class="header">
                 <div>
                     <h1 class="title">Proxy Gateway Console</h1>
-                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация, спойлер рассуждений и задержки</p>
+                    <p style="color: var(--muted); font-size: 13px; margin-top: 2px;">Маршрутизация, мышление (0x-5x) и задержки</p>
                 </div>
                 <div class="status-pill">Active • 2026 Production</div>
             </div>
@@ -385,7 +442,7 @@ def admin_page(key: str = Depends(verify_admin)):
 
             <div class="card">
                 <div class="card-header">
-                    <div class="card-title">3. Модели: Vision, Рассуждения и Задержка</div>
+                    <div class="card-title">3. Модели: Vision, Рассуждения (0x - 5x) и Задержка</div>
                     <button type="button" onclick="openAddModal()">+ Добавить модель</button>
                 </div>
                 <div class="table-responsive">
@@ -426,10 +483,14 @@ def admin_page(key: str = Depends(verify_admin)):
                             </select>
                         </div>
                         <div class="form-group" style="flex: 1;">
-                            <label>Рассуждения (Reasoning)</label>
+                            <label>Мышление / Рассуждения</label>
                             <select name="is_reasoning" id="modal_is_reasoning">
-                                <option value="1">Включено (Спойлер)</option>
-                                <option value="0">Выключено</option>
+                                <option value="0">0x: Нет мышления (Вырезать)</option>
+                                <option value="1">1x: Мышление (Без анализа промпта)</option>
+                                <option value="2">2x: Мышление (Перепроверка 1 раз)</option>
+                                <option value="3">3x: Мышление (Перепроверка 2 раза)</option>
+                                <option value="4">4x: Мышление (Глубокий аудит)</option>
+                                <option value="5">5x: Мышление (Максимальная глубина)</option>
                             </select>
                         </div>
                     </div>
@@ -489,7 +550,7 @@ def admin_page(key: str = Depends(verify_admin)):
                 document.getElementById('modal_real_model').value = btn.dataset.real;
                 document.getElementById('modal_fake_model').value = btn.dataset.fake;
                 document.getElementById('modal_is_vision').value = btn.dataset.vision;
-                document.getElementById('modal_is_reasoning').value = btn.dataset.reasoning || '0';
+                document.getElementById('modal_is_reasoning').value = btn.dataset.reasoning !== undefined ? btn.dataset.reasoning : '0';
                 document.getElementById('modal_context_length').value = btn.dataset.ctx;
                 document.getElementById('modal_owned_by').value = btn.dataset.owned;
                 document.getElementById('modal_delay_sec').value = btn.dataset.delay || '0.0';
@@ -630,8 +691,8 @@ async def stream_filter_generator(
 
                         content = delta.get("content", "")
 
-                        if content:
-                            if is_reasoning == 1:
+                        if is_reasoning >= 1:
+                            if content:
                                 if not in_think:
                                     if "<think>" in content:
                                         in_think = True
@@ -657,9 +718,11 @@ async def stream_filter_generator(
                                     else:
                                         delta["reasoning_content"] = content
                                         delta.pop("content", None)
-                            else:
-                                delta.pop("reasoning_content", None)
-                                delta.pop("reasoning_details", None)
+                        else:
+                            # Режим 0x: Полное вырезание блока think
+                            delta.pop("reasoning_content", None)
+                            delta.pop("reasoning_details", None)
+                            if content:
                                 if not in_think:
                                     if "<think>" in content:
                                         in_think = True
@@ -744,14 +807,15 @@ async def proxy(request: Request, path: str):
             stream_throttle = bool(model_info[7]) if len(model_info) > 7 else False
             is_reasoning = int(model_info[8]) if len(model_info) > 8 else 0
 
-    # 1. Инъекция системного промпта рассуждений
-    if requested_model and isinstance(parsed_req, dict) and is_reasoning == 1:
+    # 1. Инъекция системного промпта рассуждений (уровни 1x-5x)
+    if requested_model and isinstance(parsed_req, dict) and is_reasoning >= 1:
+        reasoning_instruction = get_reasoning_prompt(is_reasoning)
         messages = parsed_req.setdefault("messages", [])
         system_msg = next((m for m in messages if m.get("role") == "system"), None)
         if system_msg:
-            system_msg["content"] = str(system_msg.get("content", "")) + "\n\n" + REASONING_SYSTEM_INSTRUCTION
+            system_msg["content"] = str(system_msg.get("content", "")) + "\n\n" + reasoning_instruction
         else:
-            messages.insert(0, {"role": "system", "content": REASONING_SYSTEM_INSTRUCTION})
+            messages.insert(0, {"role": "system", "content": reasoning_instruction})
         body = json.dumps(parsed_req, ensure_ascii=False).encode("utf-8")
 
     # 2. Обработка модальностей: Real Vision, Fake Vision, Text Only
@@ -901,7 +965,7 @@ async def proxy(request: Request, path: str):
 
                     raw_content = msg.get("content", "")
                     if raw_content:
-                        if is_reasoning == 1:
+                        if is_reasoning >= 1:
                             match = re.search(r"<think>(.*?)</think>", raw_content, flags=re.DOTALL)
                             if match:
                                 msg["reasoning_content"] = match.group(1).strip()
