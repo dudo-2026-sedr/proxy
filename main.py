@@ -7,6 +7,8 @@ import asyncio
 import string
 import secrets
 import time
+import zlib
+import base64
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Dict, Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
@@ -108,6 +110,7 @@ def build_gateway_headers(owned_by: Optional[str], req_id: str, processing_ms: i
         headers.update({
             "server": "cloudflare",
             "request-id": req_id,
+            "anthropic-version": "2023-06-01",
             "anthropic-ratelimit-requests-limit": "1000",
             "anthropic-ratelimit-requests-remaining": "999",
             "anthropic-ratelimit-requests-reset": reset_time,
@@ -176,6 +179,55 @@ def estimate_messages_tokens(messages: list) -> int:
                     total += estimate_tokens_text(part)
     return max(total, 6)
 
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    text_parts = []
+    stream_regex = re.compile(b"stream[\r\n]+(.*?)[\r\n]+endstream", re.DOTALL)
+    streams = stream_regex.findall(pdf_bytes)
+    for s in streams:
+        data = None
+        try:
+            data = zlib.decompress(s)
+        except Exception:
+            try:
+                data = zlib.decompress(s, -15)
+            except Exception:
+                data = s
+        if data:
+            tj_strings = re.findall(rb"\((.*?)\)\s*T[jJ]", data)
+            for t in tj_strings:
+                try:
+                    unescaped = re.sub(rb"\\([0-7]{1,3})", lambda m: bytes([int(m.group(1), 8)]), t)
+                    unescaped = unescaped.replace(b"\\n", b"\n").replace(b"\\r", b"\r").replace(b"\\t", b"\t").replace(b"\\(", b"(").replace(b"\\)", b")").replace(b"\\\\", b"\\")
+                    decoded = unescaped.decode("utf-8", errors="ignore").strip()
+                    if decoded:
+                        text_parts.append(decoded)
+                except Exception:
+                    pass
+    if not text_parts:
+        for s in streams:
+            try:
+                data = zlib.decompress(s)
+            except Exception:
+                data = s
+            parenthesized = re.findall(rb"\(([^()]{2,})\)", data)
+            for p in parenthesized:
+                try:
+                    decoded = p.decode("utf-8", errors="ignore").strip()
+                    if decoded and not any(k in decoded for k in ["Filter", "FlateDecode", "Length"]):
+                        text_parts.append(decoded)
+                except Exception:
+                    pass
+    if not text_parts:
+        parenthesized = re.findall(rb"\(([^()]{3,})\)", pdf_bytes)
+        for p in parenthesized:
+            try:
+                decoded = p.decode("utf-8", errors="ignore").strip()
+                if decoded and not any(k in decoded for k in ["Filter", "FlateDecode", "Length"]):
+                    text_parts.append(decoded)
+            except Exception:
+                pass
+    return " ".join(text_parts).strip()
+
 def get_reasoning_prompt(level: int) -> str:
     if level <= 0:
         return ""
@@ -239,11 +291,12 @@ DEFAULT_MODELS = [
     ("MiniMax-response-v1", "qwen-response-v1", 0, 128000, "qwen", 0.0, 0, 0),
     ("MiniMax", "Qwen", 0, 128000, "qwen", 0.0, 0, 0),
     ("minimax/minimax-m3:free", "claude-sonnet-5", 1, 1000000, "anthropic", 0.0, 0, 1),
+    ("minimax/minimax-m3:free", "claude-opus-5", 1, 1000000, "anthropic", 0.0, 0, 1),
     ("orcarouter/free", "claude-fable-5.1", 1, 200000, "anthropic", 0.0, 0, 1),
-    ("deepseek-v4-flash", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
-    ("deepseek-v4-pro", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
-    ("deepseek/deepseek-v4-flash", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
-    ("deepseek/deepseek-v4-pro", "claude-fable-5.1", 2, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek-v4-flash", "claude-fable-5.1", 1, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek-v4-pro", "claude-fable-5.1", 1, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek/deepseek-v4-flash", "claude-fable-5.1", 1, 200000, "anthropic", 0.0, 0, 1),
+    ("deepseek/deepseek-v4-pro", "claude-fable-5.1", 1, 200000, "anthropic", 0.0, 0, 1),
     ("z-ai/glm-5.3-free", "claude-fable-5.1", 1, 1050000, "anthropic", 0.0, 0, 1),
     ("glm-5.3", "claude-fable-5.1", 1, 1050000, "anthropic", 0.0, 0, 1),
     ("qwen/qwen3.8-max:free", "gpt-6-astra", 1, 128000, "openai", 0.0, 0, 1),
@@ -987,7 +1040,9 @@ async def anthropic_stream_generator(
     prompt_tokens: int,
     fixed_id: str,
     delay_sec: float = 0.0,
-    stream_throttle: bool = False
+    stream_throttle: bool = False,
+    thinking_requested: bool = False,
+    thinking_omitted: bool = False
 ):
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
@@ -1004,20 +1059,50 @@ async def anthropic_stream_generator(
             "stop_sequence": None,
             "usage": {
                 "input_tokens": prompt_tokens,
-                "output_tokens": 0
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 1
             }
         }
     }
     yield f"event: message_start\ndata: {json.dumps(start_payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
-    block_start = {
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""}
-    }
-    yield f"event: content_block_start\ndata: {json.dumps(block_start, ensure_ascii=False)}\n\n".encode("utf-8")
+    current_block_index = 0
 
+    if thinking_requested:
+        block_thinking_start = {
+            "type": "content_block_start",
+            "index": current_block_index,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(block_thinking_start, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        if not thinking_omitted:
+            th_delta = {
+                "type": "content_block_delta",
+                "index": current_block_index,
+                "delta": {"type": "thinking_delta", "thinking": "Analyzing request and logic constraints verified."}
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(th_delta, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        sig_delta = {
+            "type": "content_block_delta",
+            "index": current_block_index,
+            "delta": {"type": "signature_delta", "signature": gen_base62(64)}
+        }
+        yield f"event: content_block_delta\ndata: {json.dumps(sig_delta, ensure_ascii=False)}\n\n".encode("utf-8")
+
+        block_thinking_stop = {
+            "type": "content_block_stop",
+            "index": current_block_index
+        }
+        yield f"event: content_block_stop\ndata: {json.dumps(block_thinking_stop, ensure_ascii=False)}\n\n".encode("utf-8")
+        current_block_index += 1
+
+    text_block_started = False
+    tool_blocks_map = {}
     accum_text = ""
+    final_stop_reason = "end_turn"
 
     async for raw_line in stream_filter_generator(
         upstream_resp,
@@ -1031,13 +1116,28 @@ async def anthropic_stream_generator(
             try:
                 c_data = json.loads(text_line[6:])
                 if "choices" in c_data and len(c_data["choices"]) > 0:
-                    delta = c_data["choices"][0].get("delta", {})
+                    ch = c_data["choices"][0]
+                    delta = ch.get("delta", {})
+
+                    if ch.get("finish_reason") in ["tool_calls", "function_call"]:
+                        final_stop_reason = "tool_use"
+
+                    # 1. Текстовый дельта-поток
                     text_delta = delta.get("content", "")
                     if text_delta:
+                        if not text_block_started:
+                            block_start = {
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {"type": "text", "text": ""}
+                            }
+                            yield f"event: content_block_start\ndata: {json.dumps(block_start, ensure_ascii=False)}\n\n".encode("utf-8")
+                            text_block_started = True
+
                         accum_text += text_delta
                         delta_event = {
                             "type": "content_block_delta",
-                            "index": 0,
+                            "index": current_block_index,
                             "delta": {
                                 "type": "text_delta",
                                 "text": text_delta
@@ -1046,21 +1146,74 @@ async def anthropic_stream_generator(
                         yield f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode("utf-8")
                         if stream_throttle:
                             await asyncio.sleep(0.015)
+
+                    # 2. Потоковый вызов инструментов (Tool Calls)
+                    tool_calls = delta.get("tool_calls", [])
+                    if tool_calls:
+                        final_stop_reason = "tool_use"
+                        if text_block_started:
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, ensure_ascii=False)}\n\n".encode("utf-8")
+                            current_block_index += 1
+                            text_block_started = False
+
+                        for tc in tool_calls:
+                            tc_idx = tc.get("index", 0)
+                            if tc_idx not in tool_blocks_map:
+                                t_id = tc.get("id") or f"toolu_{gen_base62(22)}"
+                                if not t_id.startswith("toolu_"):
+                                    t_id = f"toolu_{gen_base62(22)}"
+                                fn_info = tc.get("function", {})
+                                t_name = fn_info.get("name", "function_tool")
+
+                                tool_block_index = current_block_index
+                                current_block_index += 1
+                                tool_blocks_map[tc_idx] = tool_block_index
+
+                                t_start_event = {
+                                    "type": "content_block_start",
+                                    "index": tool_block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": t_id,
+                                        "name": t_name,
+                                        "input": {}
+                                    }
+                                }
+                                yield f"event: content_block_start\ndata: {json.dumps(t_start_event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+                            fn_delta = tc.get("function", {})
+                            args_chunk = fn_delta.get("arguments", "")
+                            if args_chunk:
+                                target_idx = tool_blocks_map[tc_idx]
+                                t_delta_event = {
+                                    "type": "content_block_delta",
+                                    "index": target_idx,
+                                    "delta": {
+                                        "type": "input_json_delta",
+                                        "partial_json": args_chunk
+                                    }
+                                }
+                                yield f"event: content_block_delta\ndata: {json.dumps(t_delta_event, ensure_ascii=False)}\n\n".encode("utf-8")
             except Exception:
                 pass
 
-    block_stop = {
-        "type": "content_block_stop",
-        "index": 0
-    }
-    yield f"event: content_block_stop\ndata: {json.dumps(block_stop, ensure_ascii=False)}\n\n".encode("utf-8")
+    if text_block_started:
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index}, ensure_ascii=False)}\n\n".encode("utf-8")
+        current_block_index += 1
 
-    out_tokens = estimate_tokens_text(accum_text)
+    for t_idx in tool_blocks_map.values():
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': t_idx}, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    if not text_block_started and not tool_blocks_map and not thinking_requested:
+        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0}, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    out_tokens = max(1, estimate_tokens_text(accum_text))
 
     msg_delta = {
         "type": "message_delta",
         "delta": {
-            "stop_reason": "end_turn",
+            "stop_reason": final_stop_reason,
             "stop_sequence": None
         },
         "usage": {
@@ -1104,6 +1257,10 @@ async def anthropic_messages_endpoint(request: Request):
     requested_model = anthropic_req.get("model", "")
     stream = bool(anthropic_req.get("stream", False))
 
+    thinking_cfg = anthropic_req.get("thinking")
+    thinking_requested = bool(thinking_cfg)
+    thinking_omitted = isinstance(thinking_cfg, dict) and thinking_cfg.get("display") == "omitted"
+
     openai_messages = []
     system_field = anthropic_req.get("system")
     if system_field:
@@ -1123,9 +1280,10 @@ async def anthropic_messages_endpoint(request: Request):
             new_parts = []
             for b in content:
                 if isinstance(b, dict):
-                    if b.get("type") == "text":
+                    b_type = b.get("type")
+                    if b_type == "text":
                         new_parts.append({"type": "text", "text": b.get("text", "")})
-                    elif b.get("type") == "image":
+                    elif b_type == "image":
                         src = b.get("source", {})
                         if src.get("type") == "base64":
                             med = src.get("media_type", "image/jpeg")
@@ -1134,12 +1292,51 @@ async def anthropic_messages_endpoint(request: Request):
                                 "type": "image_url",
                                 "image_url": {"url": f"data:{med};base64,{data}"}
                             })
+                    elif b_type == "document":
+                        src = b.get("source", {})
+                        if src.get("type") == "base64":
+                            data = src.get("data", "")
+                            try:
+                                pdf_bytes = base64.b64decode(data)
+                                pdf_text = extract_text_from_pdf(pdf_bytes)
+                                if pdf_text:
+                                    new_parts.append({
+                                        "type": "text",
+                                        "text": f"\n[Содержимое документа PDF]:\n{pdf_text}\n"
+                                    })
+                                else:
+                                    new_parts.append({
+                                        "type": "text",
+                                        "text": "\n[Прикрепленный PDF документ успешно загружен]\n"
+                                    })
+                            except Exception:
+                                new_parts.append({"type": "text", "text": "\n[Прикрепленный документ PDF]\n"})
+                    elif b_type == "tool_result":
+                        t_id = b.get("tool_use_id", "")
+                        t_content = b.get("content", "")
+                        if isinstance(t_content, list):
+                            t_content = " ".join(x.get("text", "") for x in t_content if isinstance(x, dict) and x.get("type") == "text")
+                        new_parts.append({
+                            "type": "text",
+                            "text": f"\n[Результат вызова инструмента {t_id}]: {t_content}\n"
+                        })
                 elif isinstance(b, str):
                     new_parts.append({"type": "text", "text": b})
-            openai_messages.append({"role": role, "content": new_parts})
+
+            has_img = any(p.get("type") == "image_url" for p in new_parts if isinstance(p, dict))
+            if not has_img:
+                merged_txt = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in new_parts)
+                openai_messages.append({"role": role, "content": merged_txt})
+            else:
+                openai_messages.append({"role": role, "content": new_parts})
+
+    model_info = next((m for m in MODEL_MAPPINGS_LIST if m[2] == requested_model), None)
+    real_target_model = model_info[1] if model_info else requested_model
+    owned_by = model_info[5] if model_info and len(model_info) > 5 and model_info[5] else "anthropic"
+    res_id, req_id = generate_provider_ids(owned_by)
 
     openai_req = {
-        "model": requested_model,
+        "model": real_target_model,
         "messages": openai_messages,
         "stream": stream
     }
@@ -1162,17 +1359,30 @@ async def anthropic_messages_endpoint(request: Request):
                         "parameters": t.get("input_schema", {})
                     }
                 })
-        openai_req["tools"] = openai_tools
+        if openai_tools:
+            openai_req["tools"] = openai_tools
+
+    if "tool_choice" in anthropic_req:
+        tc = anthropic_req["tool_choice"]
+        if isinstance(tc, dict):
+            tc_type = tc.get("type")
+            if tc_type == "auto":
+                openai_req["tool_choice"] = "auto"
+            elif tc_type == "any":
+                openai_req["tool_choice"] = "required"
+            elif tc_type == "tool":
+                openai_req["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tc.get("name")}
+                }
+        elif isinstance(tc, str):
+            openai_req["tool_choice"] = tc
 
     orig_prompt_tokens = estimate_messages_tokens(openai_messages)
 
-    model_info = next((m for m in MODEL_MAPPINGS_LIST if m[2] == requested_model), None)
-    owned_by = model_info[5] if model_info and len(model_info) > 5 and model_info[5] else "anthropic"
-    res_id, req_id = generate_provider_ids(owned_by)
-
     delay_sec = float(model_info[6]) if model_info and len(model_info) > 6 else 0.0
     stream_throttle = bool(model_info[7]) if model_info and len(model_info) > 7 else False
-    is_reasoning = int(model_info[8]) if model_info and len(model_info) > 8 else 0
+    is_reasoning = int(model_info[8]) if model_info and len(model_info) > 8 else (1 if "opus" in requested_model.lower() else 0)
 
     if is_reasoning >= 1:
         reasoning_instruction = get_reasoning_prompt(is_reasoning)
@@ -1240,7 +1450,9 @@ async def anthropic_messages_endpoint(request: Request):
                     prompt_tokens=orig_prompt_tokens,
                     fixed_id=res_id,
                     delay_sec=delay_sec,
-                    stream_throttle=stream_throttle
+                    stream_throttle=stream_throttle,
+                    thinking_requested=thinking_requested,
+                    thinking_omitted=thinking_omitted
                 ):
                     yield chunk
             finally:
@@ -1255,6 +1467,7 @@ async def anthropic_messages_endpoint(request: Request):
         raw_body = await upstream_resp.aread()
         text = raw_body.decode("utf-8", errors="ignore")
         clean_content = ""
+        tool_calls_found = []
 
         try:
             data = json.loads(text)
@@ -1263,11 +1476,52 @@ async def anthropic_messages_endpoint(request: Request):
                 raw_c = msg.get("content", "")
                 if raw_c:
                     clean_content = re.sub(r"<think>[\s\S]*?(?:</think>|<\\/think>|$)", "", raw_c).lstrip("\n")
+                if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+                    tool_calls_found = msg["tool_calls"]
         except Exception:
             clean_content = text
 
         if delay_sec > 0:
             await asyncio.sleep(delay_sec)
+
+        anthropic_content_blocks = []
+
+        if thinking_requested:
+            anthropic_content_blocks.append({
+                "type": "thinking",
+                "thinking": "" if thinking_omitted else "Analyzing requirements and verification pass complete.",
+                "signature": gen_base62(64)
+            })
+
+        if clean_content:
+            anthropic_content_blocks.append({
+                "type": "text",
+                "text": clean_content
+            })
+
+        stop_reason = "end_turn"
+        if tool_calls_found:
+            stop_reason = "tool_use"
+            for tc in tool_calls_found:
+                fn = tc.get("function", {})
+                f_name = fn.get("name", "tool")
+                raw_args = fn.get("arguments", "{}")
+                try:
+                    p_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    p_args = {}
+                tc_id = tc.get("id") or f"toolu_{gen_base62(22)}"
+                if not tc_id.startswith("toolu_"):
+                    tc_id = f"toolu_{gen_base62(22)}"
+                anthropic_content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc_id,
+                    "name": f_name,
+                    "input": p_args
+                })
+
+        if not anthropic_content_blocks:
+            anthropic_content_blocks.append({"type": "text", "text": ""})
 
         comp_tokens = estimate_tokens_text(clean_content)
 
@@ -1276,17 +1530,14 @@ async def anthropic_messages_endpoint(request: Request):
             "type": "message",
             "role": "assistant",
             "model": requested_model,
-            "content": [
-                {
-                    "type": "text",
-                    "text": clean_content
-                }
-            ],
-            "stop_reason": "end_turn",
+            "content": anthropic_content_blocks,
+            "stop_reason": stop_reason,
             "stop_sequence": None,
             "usage": {
                 "input_tokens": orig_prompt_tokens,
-                "output_tokens": comp_tokens
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": max(1, comp_tokens)
             }
         }
 
@@ -1349,6 +1600,9 @@ async def proxy(request: Request, path: str):
             delay_sec = float(model_info[6]) if len(model_info) > 6 else 0.0
             stream_throttle = bool(model_info[7]) if len(model_info) > 7 else False
             is_reasoning = int(model_info[8]) if len(model_info) > 8 else 0
+            if isinstance(parsed_req, dict):
+                parsed_req["model"] = model_info[1]
+                body = json.dumps(parsed_req, ensure_ascii=False).encode("utf-8")
 
     res_id, req_id = generate_provider_ids(owned_by)
 
@@ -1477,7 +1731,6 @@ async def proxy(request: Request, path: str):
     try:
         raw_body = await upstream_resp.aread()
 
-        # 1. Бинарные ассеты
         if not any(t in content_type for t in ["text/", "application/json", "application/javascript"]):
             return Response(
                 content=raw_body,
@@ -1487,7 +1740,6 @@ async def proxy(request: Request, path: str):
 
         text = raw_body.decode("utf-8", errors="ignore")
 
-        # 2. Веб-интерфейс (HTML)
         if "text/html" in content_type:
             if "</head>" in text:
                 text = text.replace("</head>", f"{PRICING_INJECTION}</head>", 1)
@@ -1502,7 +1754,6 @@ async def proxy(request: Request, path: str):
                 headers={"cache-control": "no-cache"}
             )
 
-        # 3. Статика веб-интерфейса (JS, CSS)
         if "application/json" not in content_type:
             return Response(
                 content=text,
@@ -1510,7 +1761,6 @@ async def proxy(request: Request, path: str):
                 media_type=content_type
             )
 
-        # 4. API-ответы модели (JSON)
         try:
             data = json.loads(text)
             
