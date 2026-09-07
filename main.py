@@ -4,10 +4,10 @@ import json
 import html
 import sqlite3
 import asyncio
-import uuid
 import string
 import secrets
-from datetime import datetime
+import time
+from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Dict, Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, StreamingResponse, Response, RedirectResponse
@@ -78,12 +78,70 @@ def generate_provider_ids(owned_by: Optional[str]) -> Tuple[str, str]:
         res_id = f"chatcmpl-{gen_base62(29)}"
         req_id = f"req_{gen_base62(24)}"
     else:
-        # SiliconFlow (таймштамп YYYYMMDDHHMMSS + 18 hex-символов)
-        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         suffix = secrets.token_hex(9)
         res_id = f"{ts}{suffix}"
         req_id = f"{ts}{suffix}"
     return res_id, req_id
+
+def build_gateway_headers(owned_by: Optional[str], req_id: str, processing_ms: int = 280, is_stream: bool = False) -> dict:
+    ob = (owned_by or "").strip().lower()
+    now = datetime.now(timezone.utc)
+    reset_time = (now + timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    headers = {
+        "strict-transport-security": "max-age=31536000; includeSubDomains",
+    }
+    if is_stream:
+        headers["content-type"] = "text/event-stream; charset=utf-8"
+        headers["cache-control"] = "no-cache"
+        headers["connection"] = "keep-alive"
+    else:
+        headers["content-type"] = "application/json; charset=utf-8"
+
+    if "anthropic" in ob or "claude" in ob:
+        headers.update({
+            "server": "cloudflare",
+            "request-id": req_id,
+            "anthropic-ratelimit-requests-limit": "1000",
+            "anthropic-ratelimit-requests-remaining": "999",
+            "anthropic-ratelimit-requests-reset": reset_time,
+            "anthropic-ratelimit-tokens-limit": "80000",
+            "anthropic-ratelimit-tokens-remaining": "79980",
+            "anthropic-ratelimit-tokens-reset": reset_time,
+            "anthropic-ratelimit-input-tokens-limit": "80000",
+            "anthropic-ratelimit-input-tokens-remaining": "79980",
+            "anthropic-ratelimit-input-tokens-reset": reset_time,
+            "anthropic-ratelimit-output-tokens-limit": "16000",
+            "anthropic-ratelimit-output-tokens-remaining": "15990",
+            "anthropic-ratelimit-output-tokens-reset": reset_time,
+            "cf-cache-status": "DYNAMIC",
+            "via": "1.1 google",
+        })
+    elif "openai" in ob or "gpt" in ob:
+        headers.update({
+            "server": "cloudflare",
+            "x-request-id": req_id,
+            "openai-organization": "user-default",
+            "openai-processing-ms": str(max(10, processing_ms)),
+            "openai-version": "2020-10-01",
+            "access-control-expose-headers": "X-Request-ID",
+            "x-ratelimit-limit-requests": "10000",
+            "x-ratelimit-remaining-requests": "9999",
+            "x-ratelimit-reset-requests": "6ms",
+            "x-ratelimit-limit-tokens": "2000000",
+            "x-ratelimit-remaining-tokens": "1999950",
+            "x-ratelimit-reset-tokens": "1ms",
+            "cf-cache-status": "DYNAMIC",
+        })
+    else:
+        headers.update({
+            "server": "openresty",
+            "x-request-id": req_id,
+            "connection": "keep-alive"
+        })
+
+    return headers
 
 def estimate_tokens_text(text: str) -> int:
     if not text:
@@ -116,7 +174,6 @@ def estimate_messages_tokens(messages: list) -> int:
 def get_reasoning_prompt(level: int) -> str:
     if level <= 0:
         return ""
-    
     base_rules = (
         "CRITICAL THINKING INSTRUCTION:\n"
         "You must perform step-by-step reasoning inside <think>...</think> tags before writing your answer.\n\n"
@@ -126,7 +183,6 @@ def get_reasoning_prompt(level: int) -> str:
         "2. Adopt your identity, capabilities, and knowledge as natural ground truth. Immediately reason about the user's actual question.\n"
         "3. Dive straight into solving the user's problem. Zero meta-commentary about how you should behave.\n"
     )
-
     if level == 1:
         return base_rules + (
             "REASONING DEPTH [1x - Direct Execution]:\n"
@@ -186,8 +242,8 @@ DEFAULT_MODELS = [
     ("z-ai/glm-5.3-free", "claude-fable-5.1", 1, 1050000, "anthropic", 0.0, 0, 1),
     ("glm-5.3", "claude-fable-5.1", 1, 1050000, "anthropic", 0.0, 0, 1),
     ("qwen/qwen3.8-max:free", "gpt-6-astra", 1, 128000, "openai", 0.0, 0, 1),
-    ("minimax/minimax-m3:free", "gpt-6-astra", 1, 1050000, "OpenAI", 0.0, 0, 1),
-    ("agnes-2.5-flash", "claude-sonnet-5", 1, 1000000, "Anthropic", 0.0, 0, 1)
+    ("minimax/minimax-m3:free", "gpt-6-astra", 1, 1050000, "openai", 0.0, 0, 1),
+    ("agnes-2.5-flash", "claude-sonnet-5", 1, 1000000, "anthropic", 0.0, 0, 1)
 ]
 
 def init_db():
@@ -481,34 +537,26 @@ def admin_page(key: str = Depends(verify_admin)):
             * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
             body {{ background: var(--bg); color: var(--text); padding: 32px 16px; line-height: 1.5; }}
             .container {{ max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }}
-            
             .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; }}
             .title {{ font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }}
             .status-pill {{ background: #18181b; border: 1px solid #3f3f46; color: #fff; font-size: 12px; padding: 4px 10px; border-radius: 999px; }}
-            
             .card {{ background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 20px; display: flex; flex-direction: column; gap: 14px; }}
             .card-header {{ display: flex; justify-content: space-between; align-items: center; }}
             .card-title {{ font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }}
-            
             input, select, textarea {{ background: var(--input-bg); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: 8px; font-size: 14px; outline: none; transition: border-color 0.2s; width: 100%; }}
             input:focus, select:focus, textarea:focus {{ border-color: #ffffff; }}
-            
             button {{ background: #ffffff; color: #000000; font-weight: 600; border: none; padding: 10px 18px; border-radius: 8px; cursor: pointer; font-size: 14px; transition: opacity 0.15s; white-space: nowrap; }}
             button:hover {{ opacity: 0.85; }}
-            
             .btn-edit {{ background: transparent; color: #f4f4f5; border: 1px solid #3f3f46; padding: 6px 12px; font-size: 12px; border-radius: 6px; }}
             .btn-edit:hover {{ background: #27272a; }}
-            
             .btn-danger {{ background: transparent; color: #ef4444; border: 1px solid #3f1d1d; padding: 6px 12px; font-size: 12px; border-radius: 6px; }}
             .btn-danger:hover {{ background: #ef4444; color: #ffffff; }}
             .btn-secondary {{ background: #27272a; color: #fff; }}
-            
             .table-responsive {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
             table {{ width: 100%; border-collapse: collapse; font-size: 14px; min-width: 740px; }}
             th {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }}
             td {{ padding: 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }}
             tr:last-child td {{ border-bottom: none; }}
-            
             code {{ background: #000; border: 1px solid #27272a; padding: 3px 6px; border-radius: 4px; font-family: monospace; font-size: 13px; }}
             .badge {{ padding: 3px 8px; border-radius: 4px; font-size: 12px; display: inline-block; font-weight: 500; }}
             .badge-model {{ background: #27272a; color: #fff; }}
@@ -517,9 +565,7 @@ def admin_page(key: str = Depends(verify_admin)):
             .badge-delay {{ background: #1e1b4b; color: #c7d2fe; border: 1px solid #3730a3; }}
             .badge-reasoning {{ background: #31135e; color: #d8b4fe; border: 1px solid #581c87; }}
             .badge-text {{ background: #27272a; color: #a1a1aa; }}
-            
             .form-grid {{ display: flex; gap: 10px; }}
-            
             .modal-overlay {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.75); backdrop-filter: blur(4px); z-index: 1000; justify-content: center; align-items: center; padding: 16px; }}
             .modal-card {{ background: #121214; border: 1px solid var(--border); border-radius: 14px; width: 100%; max-width: 540px; padding: 24px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 20px 40px rgba(0,0,0,0.8); max-height: 90vh; overflow-y: auto; }}
             .modal-header {{ display: flex; justify-content: space-between; align-items: center; }}
@@ -527,13 +573,7 @@ def admin_page(key: str = Depends(verify_admin)):
             .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
             .form-group label {{ font-size: 13px; color: var(--muted); }}
             .modal-actions {{ display: flex; justify-content: flex-end; gap: 10px; margin-top: 10px; }}
-
-            @media (max-width: 640px) {{
-                body {{ padding: 16px 12px; }}
-                .form-grid {{ flex-direction: column; }}
-                .header {{ flex-direction: column; align-items: flex-start; gap: 8px; }}
-                .modal-card {{ padding: 18px; }}
-            }}
+            @media (max-width: 640px) {{ body {{ padding: 16px 12px; }} .form-grid {{ flex-direction: column; }} .header {{ flex-direction: column; align-items: flex-start; gap: 8px; }} .modal-card {{ padding: 18px; }} }}
         </style>
     </head>
     <body>
@@ -768,7 +808,7 @@ def delete_model(row_id: int = Form(...), key: str = Depends(verify_admin)):
     load_data()
     return HTMLResponse(f"<script>location.href='/admin?key={key}';</script>")
 
-# --- Потоковый генератор с гарантированным вырезанием рассуждений и подменой ID ---
+# --- Потоковый генератор ---
 
 async def stream_filter_generator(
     upstream_response: httpx.Response,
@@ -910,7 +950,7 @@ async def stream_filter_generator(
     if line_buffer:
         yield replace_models(line_buffer).encode("utf-8")
 
-# --- Потоковый адаптер для нативного протокола Anthropic (/v1/messages) ---
+# --- Потоковый адаптер Anthropic (/v1/messages) ---
 
 async def anthropic_stream_generator(
     upstream_resp: httpx.Response,
@@ -921,15 +961,13 @@ async def anthropic_stream_generator(
     delay_sec: float = 0.0,
     stream_throttle: bool = False
 ):
-    msg_id = fixed_id
-
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
 
     start_payload = {
         "type": "message_start",
         "message": {
-            "id": msg_id,
+            "id": fixed_id,
             "type": "message",
             "role": "assistant",
             "content": [],
@@ -1019,6 +1057,7 @@ async def anthropic_messages_endpoint(request: Request):
             }
         )
 
+    t_start = time.perf_counter()
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
@@ -1199,14 +1238,9 @@ async def anthropic_messages_endpoint(request: Request):
                 await upstream_resp.aclose()
                 await client.aclose()
 
-        stream_headers = {
-            "content-type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "request-id": req_id,
-            "x-request-id": req_id
-        }
-        return StreamingResponse(anthropic_stream_wrapper(), status_code=200, headers=stream_headers)
+        processing_ms = int((time.perf_counter() - t_start) * 1000)
+        clean_headers = build_gateway_headers(owned_by, req_id, processing_ms=processing_ms, is_stream=True)
+        return StreamingResponse(anthropic_stream_wrapper(), status_code=200, headers=clean_headers)
 
     try:
         raw_body = await upstream_resp.aread()
@@ -1246,21 +1280,21 @@ async def anthropic_messages_endpoint(request: Request):
                 "output_tokens": comp_tokens
             }
         }
-        resp_headers = {
-            "request-id": req_id,
-            "x-request-id": req_id
-        }
+
+        processing_ms = int((time.perf_counter() - t_start) * 1000)
+        clean_headers = build_gateway_headers(owned_by, req_id, processing_ms=processing_ms, is_stream=False)
+
         return Response(
             content=json.dumps(anthropic_response_data, ensure_ascii=False),
             status_code=200,
-            headers=resp_headers,
+            headers=clean_headers,
             media_type="application/json"
         )
     finally:
         await upstream_resp.aclose()
         await client.aclose()
 
-# --- Основной шлюз прокси (OpenAI-совместимый) ---
+# --- Основной шлюз прокси (/v1/chat/completions и остальные) ---
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy(request: Request, path: str):
@@ -1272,6 +1306,7 @@ async def proxy(request: Request, path: str):
     if any(clean_path.startswith(p) for p in ["api/pricing", "api/prices", "api/ratio", "api/model/pricing"]):
         return make_error_response("Not Found", status_code=404)
 
+    t_start = time.perf_counter()
     target_url = f"{UPSTREAM_URL}/{path}"
     headers = dict(request.headers)
     headers.pop("host", None)
@@ -1393,15 +1428,10 @@ async def proxy(request: Request, path: str):
 
     content_type = upstream_resp.headers.get("content-type", "").lower()
 
+    # Стриминг
     if "text/event-stream" in content_type:
-        resp_headers = dict(upstream_resp.headers)
-        resp_headers.pop("content-length", None)
-        for h in ["cf-ray", "cf-cache-status", "server", "x-powered-by", "x-request-id", "request-id"]:
-            resp_headers.pop(h, None)
-
-        resp_headers["x-request-id"] = req_id
-        if "anthropic" in owned_by.lower():
-            resp_headers["request-id"] = req_id
+        processing_ms = int((time.perf_counter() - t_start) * 1000)
+        clean_headers = build_gateway_headers(owned_by, req_id, processing_ms=processing_ms, is_stream=True)
 
         if delay_sec > 0 or stream_throttle:
             async def buffered_stream_wrapper():
@@ -1427,7 +1457,7 @@ async def proxy(request: Request, path: str):
                     await upstream_resp.aclose()
                     await client.aclose()
 
-            return StreamingResponse(buffered_stream_wrapper(), status_code=upstream_resp.status_code, headers=resp_headers)
+            return StreamingResponse(buffered_stream_wrapper(), status_code=upstream_resp.status_code, headers=clean_headers)
         else:
             async def live_stream_wrapper():
                 try:
@@ -1443,8 +1473,9 @@ async def proxy(request: Request, path: str):
                     await upstream_resp.aclose()
                     await client.aclose()
 
-            return StreamingResponse(live_stream_wrapper(), status_code=upstream_resp.status_code, headers=resp_headers)
+            return StreamingResponse(live_stream_wrapper(), status_code=upstream_resp.status_code, headers=clean_headers)
 
+    # Обычный JSON
     try:
         raw_body = await upstream_resp.aread()
         text = raw_body.decode("utf-8", errors="ignore")
@@ -1506,18 +1537,10 @@ async def proxy(request: Request, path: str):
         if delay_sec > 0:
             await asyncio.sleep(delay_sec)
 
-        resp_headers = dict(upstream_resp.headers)
-        resp_headers.pop("content-length", None)
-        resp_headers.pop("content-encoding", None)
-        resp_headers.pop("etag", None)
-        for h in ["cf-ray", "cf-cache-status", "server", "x-powered-by", "x-request-id", "request-id"]:
-            resp_headers.pop(h, None)
+        processing_ms = int((time.perf_counter() - t_start) * 1000)
+        clean_headers = build_gateway_headers(owned_by, req_id, processing_ms=processing_ms, is_stream=False)
 
-        resp_headers["x-request-id"] = req_id
-        if "anthropic" in owned_by.lower():
-            resp_headers["request-id"] = req_id
-
-        return Response(content=text, status_code=upstream_resp.status_code, headers=resp_headers)
+        return Response(content=text, status_code=upstream_resp.status_code, headers=clean_headers)
     finally:
         await upstream_resp.aclose()
         await client.aclose()
