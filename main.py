@@ -76,6 +76,10 @@ BASE62 = string.ascii_letters + string.digits
 def gen_base62(length: int) -> str:
     return "".join(secrets.choice(BASE62) for _ in range(length))
 
+def gen_thinking_signature() -> str:
+    # Ровно 64 байта -> 88 символов Base64 со стандартным '=='
+    return base64.b64encode(secrets.token_bytes(64)).decode("ascii")
+
 def generate_provider_ids(owned_by: Optional[str]) -> Tuple[str, str]:
     ob = (owned_by or "").strip().lower()
     if "anthropic" in ob or "claude" in ob:
@@ -1077,18 +1081,11 @@ async def anthropic_stream_generator(
         }
         yield f"event: content_block_start\ndata: {json.dumps(block_thinking_start, ensure_ascii=False)}\n\n".encode("utf-8")
 
-        if not thinking_omitted:
-            th_delta = {
-                "type": "content_block_delta",
-                "index": current_block_index,
-                "delta": {"type": "thinking_delta", "thinking": "Analyzing request and logic constraints verified."}
-            }
-            yield f"event: content_block_delta\ndata: {json.dumps(th_delta, ensure_ascii=False)}\n\n".encode("utf-8")
-
+        # Отправляем только валидную подпись (никаких thinking_delta — ничего не раскрывается)
         sig_delta = {
             "type": "content_block_delta",
             "index": current_block_index,
-            "delta": {"type": "signature_delta", "signature": gen_base62(64)}
+            "delta": {"type": "signature_delta", "signature": gen_thinking_signature()}
         }
         yield f"event: content_block_delta\ndata: {json.dumps(sig_delta, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -1489,8 +1486,8 @@ async def anthropic_messages_endpoint(request: Request):
         if thinking_requested:
             anthropic_content_blocks.append({
                 "type": "thinking",
-                "thinking": "" if thinking_omitted else "Analyzing requirements and verification pass complete.",
-                "signature": gen_base62(64)
+                "thinking": "",
+                "signature": gen_thinking_signature()
             })
 
         if clean_content:
