@@ -1294,7 +1294,7 @@ async def anthropic_messages_endpoint(request: Request):
         await upstream_resp.aclose()
         await client.aclose()
 
-# --- Основной шлюз прокси (/v1/chat/completions и остальные) ---
+# --- Основной шлюз прокси (/v1/chat/completions, web-интерфейс, статика) ---
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy(request: Request, path: str):
@@ -1428,7 +1428,7 @@ async def proxy(request: Request, path: str):
 
     content_type = upstream_resp.headers.get("content-type", "").lower()
 
-    # Стриминг
+    # Стриминг SSE
     if "text/event-stream" in content_type:
         processing_ms = int((time.perf_counter() - t_start) * 1000)
         clean_headers = build_gateway_headers(owned_by, req_id, processing_ms=processing_ms, is_stream=True)
@@ -1475,11 +1475,21 @@ async def proxy(request: Request, path: str):
 
             return StreamingResponse(live_stream_wrapper(), status_code=upstream_resp.status_code, headers=clean_headers)
 
-    # Обычный JSON
+    # Веб-интерфейс, статика и обычный JSON
     try:
         raw_body = await upstream_resp.aread()
+
+        # 1. Бинарные ассеты (картинки, шрифты, иконки)
+        if not any(t in content_type for t in ["text/", "application/json", "application/javascript"]):
+            return Response(
+                content=raw_body,
+                status_code=upstream_resp.status_code,
+                media_type=content_type or "application/octet-stream"
+            )
+
         text = raw_body.decode("utf-8", errors="ignore")
 
+        # 2. Веб-интерфейс (HTML)
         if "text/html" in content_type:
             if "</head>" in text:
                 text = text.replace("</head>", f"{PRICING_INJECTION}</head>", 1)
@@ -1488,6 +1498,21 @@ async def proxy(request: Request, path: str):
             else:
                 text = PRICING_INJECTION + text
 
+            return HTMLResponse(
+                content=text,
+                status_code=upstream_resp.status_code,
+                headers={"cache-control": "no-cache"}
+            )
+
+        # 3. Статика веб-интерфейса (JS, CSS)
+        if "application/json" not in content_type:
+            return Response(
+                content=text,
+                status_code=upstream_resp.status_code,
+                media_type=content_type
+            )
+
+        # 4. API-ответы модели (JSON)
         try:
             data = json.loads(text)
             
