@@ -7,7 +7,7 @@ import asyncio
 import uuid
 from typing import List, Tuple, Dict, Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
-from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from fastapi.responses import HTMLResponse, StreamingResponse, Response, RedirectResponse
 from fastapi.security import APIKeyQuery
 import httpx
 
@@ -18,10 +18,49 @@ ADMIN_KEY = os.getenv("ADMIN_KEY")
 DB_FILE = "/data/models.db" if os.path.exists("/data") else "models.db"
 
 # Структура: (id, real_model, fake_model, is_vision, context_length, owned_by, delay_sec, stream_throttle, is_reasoning)
-# is_reasoning: 0 = Нет мышления, 1 = 1x, 2 = 2x, 3 = 3x, 4 = 4x, 5 = 5x
 MODEL_MAPPINGS_LIST: List[Tuple[int, str, str, int, int, str, float, int, int]] = []
 ERROR_RULES_LIST: List[Tuple[int, str, str]] = []
 SETTINGS: Dict[str, str] = {}
+
+PRICING_INJECTION = """
+<style>
+  /* Мгновенное скрытие кнопок и ссылок на цены в интерфейсе и меню */
+  a[href*="pricing"], a[href*="price"],
+  [href*="/pricing"], [to*="/pricing"],
+  [data-nav*="pricing"], .semi-navigation-item[href*="pricing"] {
+    display: none !important;
+  }
+</style>
+<script>
+  (function() {
+    function removePricingElements() {
+      if (window.location.pathname.includes('/pricing')) {
+        window.location.replace('/');
+        return;
+      }
+      const elements = document.querySelectorAll('a, button, div, span, li');
+      elements.forEach(el => {
+        const href = (el.getAttribute('href') || el.getAttribute('to') || '').toLowerCase();
+        const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+        if (href.includes('pricing') || href.includes('price')) {
+          el.style.setProperty('display', 'none', 'important');
+          el.remove();
+        } else if (text === 'посмотреть цены' || text === 'цены' || text === 'pricing' || text === 'view pricing') {
+          const target = el.closest('a') || el.closest('button') || el.closest('li') || el;
+          target.style.setProperty('display', 'none', 'important');
+          target.remove();
+        }
+      });
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', removePricingElements);
+    } else {
+      removePricingElements();
+    }
+    new MutationObserver(removePricingElements).observe(document.documentElement, { childList: true, subtree: true });
+  })();
+</script>
+"""
 
 def estimate_tokens_text(text: str) -> int:
     if not text:
@@ -36,7 +75,7 @@ def estimate_messages_tokens(messages: list) -> int:
     for m in messages:
         if not isinstance(m, dict):
             continue
-        total += 4  # Системный оверхед на форматирование сообщения
+        total += 4
         c = m.get("content", "")
         if isinstance(c, str):
             total += estimate_tokens_text(c)
@@ -93,7 +132,7 @@ def get_reasoning_prompt(level: int) -> str:
             "- Step 3 (First Audit): Thorough check of edge cases, logical boundaries, and potential pitfalls.\n"
             "- Step 4 (Second Audit): Critical fact-checking and consistency review to ensure zero errors."
         )
-    else:  # 5x и выше
+    else:
         return base_rules + (
             "REASONING DEPTH [5x - Maximum Exhaustive Audit]:\n"
             "- Step 1 (Architecture & Analysis): Deep deconstruction of all nuances, edge cases, and implicit needs.\n"
@@ -827,7 +866,6 @@ async def stream_filter_generator(
                             event_skipped = True
                             continue
 
-                    # Нормализация токенов в финальном чанке стрима
                     if "usage" in data and isinstance(data["usage"], dict):
                         comp_tok = estimate_tokens_text(accum_emitted_text)
                         data["usage"] = {
@@ -957,7 +995,6 @@ async def anthropic_messages_endpoint(request: Request):
     headers.pop("content-length", None)
     headers.pop("accept-encoding", None)
 
-    # Автоматическая трансляция ключа Anthropic (x-api-key) в Authorization Bearer
     api_key = headers.get("x-api-key") or headers.get("anthropic-api-key")
     if api_key and "authorization" not in headers:
         headers["authorization"] = f"Bearer {api_key}"
@@ -975,7 +1012,6 @@ async def anthropic_messages_endpoint(request: Request):
     requested_model = anthropic_req.get("model", "")
     stream = bool(anthropic_req.get("stream", False))
 
-    # Конвертация формата сообщений Anthropic в OpenAI
     openai_messages = []
     system_field = anthropic_req.get("system")
     if system_field:
@@ -1022,7 +1058,6 @@ async def anthropic_messages_endpoint(request: Request):
     if "top_p" in anthropic_req:
         openai_req["top_p"] = anthropic_req["top_p"]
 
-    # Трансляция инструментов
     if "tools" in anthropic_req and isinstance(anthropic_req["tools"], list):
         openai_tools = []
         for t in anthropic_req["tools"]:
@@ -1052,7 +1087,6 @@ async def anthropic_messages_endpoint(request: Request):
         else:
             openai_messages.insert(0, {"role": "system", "content": reasoning_instruction})
 
-    # Обработка Fake Vision / Text Only
     if model_info:
         is_vis = model_info[3]
         has_image = any(
@@ -1116,7 +1150,6 @@ async def anthropic_messages_endpoint(request: Request):
             media_type="application/json"
         )
 
-    # Стриминг Anthropic
     if stream:
         async def anthropic_stream_wrapper():
             try:
@@ -1139,7 +1172,6 @@ async def anthropic_messages_endpoint(request: Request):
             headers={"content-type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
         )
 
-    # Обычный ответ Anthropic
     try:
         raw_body = await upstream_resp.aread()
         text = raw_body.decode("utf-8", errors="ignore")
@@ -1187,10 +1219,20 @@ async def anthropic_messages_endpoint(request: Request):
         await upstream_resp.aclose()
         await client.aclose()
 
-# --- Основной шлюз прокси (OpenAI-совместимый) ---
+# --- Основной шлюз прокси ---
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy(request: Request, path: str):
+    clean_path = path.lstrip("/").lower()
+
+    # 1. Защита от прямого перехода в раздел цен
+    if clean_path in ["pricing", "pricing/"]:
+        return RedirectResponse(url="/", status_code=302)
+
+    # 2. Блокировка внутренних API цен NewAPI
+    if any(clean_path.startswith(p) for p in ["api/pricing", "api/prices", "api/ratio", "api/model/pricing"]):
+        return make_error_response("Not Found", status_code=404)
+
     target_url = f"{UPSTREAM_URL}/{path}"
     headers = dict(request.headers)
     headers.pop("host", None)
@@ -1223,7 +1265,6 @@ async def proxy(request: Request, path: str):
             stream_throttle = bool(model_info[7]) if len(model_info) > 7 else False
             is_reasoning = int(model_info[8]) if len(model_info) > 8 else 0
 
-    # 1. Скрытая инъекция инструкции мышления
     if requested_model and isinstance(parsed_req, dict) and is_reasoning >= 1:
         reasoning_instruction = get_reasoning_prompt(is_reasoning)
         messages = parsed_req.setdefault("messages", [])
@@ -1234,7 +1275,6 @@ async def proxy(request: Request, path: str):
             messages.insert(0, {"role": "system", "content": reasoning_instruction})
         body = json.dumps(parsed_req, ensure_ascii=False).encode("utf-8")
 
-    # 2. Обработка модальностей: Real Vision, Fake Vision, Text Only
     if requested_model and isinstance(parsed_req, dict) and model_info:
         is_vis = model_info[3]
         has_image = False
@@ -1283,7 +1323,6 @@ async def proxy(request: Request, path: str):
 
     client = httpx.AsyncClient(timeout=180.0)
 
-    # 3. Сетевые сбои
     try:
         req = client.build_request(
             method=request.method,
@@ -1298,7 +1337,6 @@ async def proxy(request: Request, path: str):
         msg = resolve_custom_error("connection_error timeout 502", 502)
         return make_error_response(msg, status_code=502)
 
-    # 4. HTTP ошибки
     if upstream_resp.status_code >= 400:
         try:
             err_bytes = await upstream_resp.aread()
@@ -1312,7 +1350,6 @@ async def proxy(request: Request, path: str):
 
     content_type = upstream_resp.headers.get("content-type", "").lower()
 
-    # 5. Стриминг (SSE)
     if "text/event-stream" in content_type:
         resp_headers = dict(upstream_resp.headers)
         resp_headers.pop("content-length", None)
@@ -1357,11 +1394,20 @@ async def proxy(request: Request, path: str):
 
             return StreamingResponse(live_stream_wrapper(), status_code=upstream_resp.status_code, headers=resp_headers)
 
-    # 6. JSON-ответ (Non-streaming)
     try:
         raw_body = await upstream_resp.aread()
         text = raw_body.decode("utf-8", errors="ignore")
 
+        # 3. Модификация HTML страниц (вырезание кнопки цен с сайта)
+        if "text/html" in content_type:
+            if "</head>" in text:
+                text = text.replace("</head>", f"{PRICING_INJECTION}</head>", 1)
+            elif "</body>" in text:
+                text = text.replace("</body>", f"{PRICING_INJECTION}</body>", 1)
+            else:
+                text = PRICING_INJECTION + text
+
+        # 4. Обработка API ответов
         try:
             data = json.loads(text)
             
@@ -1395,7 +1441,6 @@ async def proxy(request: Request, path: str):
                         msg["content"] = cleaned.lstrip("\n")
                         clean_content += msg["content"]
 
-            # Замена аномального расхода токенов на реалистичные цифры
             comp_tokens = estimate_tokens_text(clean_content)
             data["usage"] = {
                 "prompt_tokens": orig_prompt_tokens,
