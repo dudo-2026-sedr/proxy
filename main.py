@@ -14,7 +14,12 @@ from fastapi.responses import HTMLResponse, StreamingResponse, Response, Redirec
 from fastapi.security import APIKeyQuery
 import httpx
 
-app = FastAPI(title="Transparent LLM Proxy & Admin Dashboard")
+app = FastAPI(
+    title="API Gateway",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
 
 UPSTREAM_URL = os.getenv("UPSTREAM_URL", "https://syntro.up.railway.app").rstrip("/")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
@@ -394,17 +399,40 @@ def resolve_custom_error(raw_text: str, status_code: int = 400) -> str:
         
     return extract_original_error_message(raw_text)
 
-def make_error_response(message: str, status_code: int = 400) -> Response:
-    return Response(
-        content=json.dumps({
+def make_error_response(
+    message: str,
+    status_code: int = 400,
+    owned_by: str = "openai",
+    req_id: Optional[str] = None,
+    is_anthropic: bool = False
+) -> Response:
+    if not req_id:
+        _, req_id = generate_provider_ids(owned_by)
+    clean_headers = build_gateway_headers(owned_by, req_id, processing_ms=15, is_stream=False)
+    
+    if is_anthropic:
+        err_type = "rate_limit_error" if status_code == 429 else "invalid_request_error" if status_code == 400 else "api_error"
+        content = {
+            "type": "error",
+            "error": {
+                "type": err_type,
+                "message": message
+            }
+        }
+    else:
+        content = {
             "error": {
                 "message": message,
-                "type": "api_error",
+                "type": "rate_limit_error" if status_code == 429 else "invalid_request_error" if status_code == 400 else "api_error",
                 "param": None,
-                "code": "service_error"
+                "code": "rate_limit_exceeded" if status_code == 429 else "service_error"
             }
-        }, ensure_ascii=False),
+        }
+
+    return Response(
+        content=json.dumps(content, ensure_ascii=False),
         status_code=status_code,
+        headers=clean_headers,
         media_type="application/json"
     )
 
@@ -1071,11 +1099,7 @@ async def anthropic_messages_endpoint(request: Request):
     try:
         anthropic_req = json.loads(body_bytes)
     except Exception:
-        return Response(
-            content=json.dumps({"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid JSON"}}),
-            status_code=400,
-            media_type="application/json"
-        )
+        return make_error_response("Invalid JSON", status_code=400, owned_by="anthropic", is_anthropic=True)
 
     requested_model = anthropic_req.get("model", "")
     stream = bool(anthropic_req.get("stream", False))
@@ -1167,14 +1191,7 @@ async def anthropic_messages_endpoint(request: Request):
         )
         if has_image:
             if is_vis == 0:
-                return Response(
-                    content=json.dumps({
-                        "type": "error",
-                        "error": {"type": "invalid_request_error", "message": f"The model '{requested_model}' does not support images."}
-                    }),
-                    status_code=400,
-                    media_type="application/json"
-                )
+                return make_error_response(f"The model '{requested_model}' does not support images.", status_code=400, owned_by=owned_by, req_id=req_id, is_anthropic=True)
             elif is_vis == 2:
                 for m in openai_messages:
                     if isinstance(m.get("content"), list):
@@ -1201,11 +1218,7 @@ async def anthropic_messages_endpoint(request: Request):
     except Exception:
         await client.aclose()
         msg = resolve_custom_error("connection_error timeout 502", 502)
-        return Response(
-            content=json.dumps({"type": "error", "error": {"type": "api_error", "message": msg}}),
-            status_code=502,
-            media_type="application/json"
-        )
+        return make_error_response(msg, status_code=502, owned_by=owned_by, req_id=req_id, is_anthropic=True)
 
     if upstream_resp.status_code >= 400:
         try:
@@ -1215,11 +1228,7 @@ async def anthropic_messages_endpoint(request: Request):
             await upstream_resp.aclose()
             await client.aclose()
         msg = resolve_custom_error(raw_err_text, upstream_resp.status_code)
-        return Response(
-            content=json.dumps({"type": "error", "error": {"type": "api_error", "message": msg}}),
-            status_code=upstream_resp.status_code,
-            media_type="application/json"
-        )
+        return make_error_response(msg, status_code=upstream_resp.status_code, owned_by=owned_by, req_id=req_id, is_anthropic=True)
 
     if stream:
         async def anthropic_stream_wrapper():
@@ -1304,7 +1313,7 @@ async def proxy(request: Request, path: str):
         return RedirectResponse(url="/", status_code=302)
 
     if any(clean_path.startswith(p) for p in ["api/pricing", "api/prices", "api/ratio", "api/model/pricing"]):
-        return make_error_response("Not Found", status_code=404)
+        return make_error_response("Not Found", status_code=404, owned_by="openai")
 
     t_start = time.perf_counter()
     target_url = f"{UPSTREAM_URL}/{path}"
@@ -1370,18 +1379,7 @@ async def proxy(request: Request, path: str):
 
         if has_image:
             if is_vis == 0:
-                return Response(
-                    content=json.dumps({
-                        "error": {
-                            "message": f"The model '{requested_model}' does not support image input.",
-                            "type": "invalid_request_error",
-                            "param": "messages",
-                            "code": "model_does_not_support_vision"
-                        }
-                    }, ensure_ascii=False),
-                    status_code=400,
-                    media_type="application/json"
-                )
+                return make_error_response(f"The model '{requested_model}' does not support image input.", status_code=400, owned_by=owned_by, req_id=req_id)
             elif is_vis == 2:
                 for msg in messages:
                     content = msg.get("content")
@@ -1413,7 +1411,7 @@ async def proxy(request: Request, path: str):
     except Exception:
         await client.aclose()
         msg = resolve_custom_error("connection_error timeout 502", 502)
-        return make_error_response(msg, status_code=502)
+        return make_error_response(msg, status_code=502, owned_by=owned_by, req_id=req_id)
 
     if upstream_resp.status_code >= 400:
         try:
@@ -1424,7 +1422,7 @@ async def proxy(request: Request, path: str):
             await client.aclose()
         
         msg = resolve_custom_error(raw_err_text, upstream_resp.status_code)
-        return make_error_response(msg, status_code=upstream_resp.status_code)
+        return make_error_response(msg, status_code=upstream_resp.status_code, owned_by=owned_by, req_id=req_id)
 
     content_type = upstream_resp.headers.get("content-type", "").lower()
 
@@ -1479,7 +1477,7 @@ async def proxy(request: Request, path: str):
     try:
         raw_body = await upstream_resp.aread()
 
-        # 1. Бинарные ассеты (картинки, шрифты, иконки)
+        # 1. Бинарные ассеты
         if not any(t in content_type for t in ["text/", "application/json", "application/javascript"]):
             return Response(
                 content=raw_body,
@@ -1518,7 +1516,7 @@ async def proxy(request: Request, path: str):
             
             if data.get("error") or (data.get("base_resp", {}).get("status_code", 0) != 0):
                 msg = resolve_custom_error(text, 400)
-                return make_error_response(msg, status_code=400)
+                return make_error_response(msg, status_code=400, owned_by=owned_by, req_id=req_id)
 
             text = replace_models(text)
             data = json.loads(text)
