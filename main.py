@@ -5,6 +5,9 @@ import html
 import sqlite3
 import asyncio
 import uuid
+import string
+import secrets
+from datetime import datetime
 from typing import List, Tuple, Dict, Optional
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, StreamingResponse, Response, RedirectResponse
@@ -24,7 +27,6 @@ SETTINGS: Dict[str, str] = {}
 
 PRICING_INJECTION = """
 <style>
-  /* Мгновенное скрытие кнопок и ссылок на цены в интерфейсе и меню */
   a[href*="pricing"], a[href*="price"],
   [href*="/pricing"], [to*="/pricing"],
   [data-nav*="pricing"], .semi-navigation-item[href*="pricing"] {
@@ -61,6 +63,27 @@ PRICING_INJECTION = """
   })();
 </script>
 """
+
+BASE62 = string.ascii_letters + string.digits
+
+def gen_base62(length: int) -> str:
+    return "".join(secrets.choice(BASE62) for _ in range(length))
+
+def generate_provider_ids(owned_by: Optional[str]) -> Tuple[str, str]:
+    ob = (owned_by or "").strip().lower()
+    if "anthropic" in ob or "claude" in ob:
+        res_id = f"msg_01{gen_base62(22)}"
+        req_id = f"req_01{gen_base62(22)}"
+    elif "openai" in ob or "gpt" in ob:
+        res_id = f"chatcmpl-{gen_base62(29)}"
+        req_id = f"req_{gen_base62(24)}"
+    else:
+        # SiliconFlow (таймштамп YYYYMMDDHHMMSS + 18 hex-символов)
+        ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+        suffix = secrets.token_hex(9)
+        res_id = f"{ts}{suffix}"
+        req_id = f"{ts}{suffix}"
+    return res_id, req_id
 
 def estimate_tokens_text(text: str) -> int:
     if not text:
@@ -622,7 +645,7 @@ def admin_page(key: str = Depends(verify_admin)):
                         </div>
                         <div class="form-group" style="flex: 1;">
                             <label>Владелец (owned_by)</label>
-                            <input name="owned_by" id="modal_owned_by" value="openai" placeholder="openai, anthropic, qwen">
+                            <input name="owned_by" id="modal_owned_by" value="openai" placeholder="openai, anthropic, siliconflow, qwen">
                         </div>
                     </div>
                     
@@ -745,13 +768,14 @@ def delete_model(row_id: int = Form(...), key: str = Depends(verify_admin)):
     load_data()
     return HTMLResponse(f"<script>location.href='/admin?key={key}';</script>")
 
-# --- Потоковый генератор с гарантированным вырезанием рассуждений ---
+# --- Потоковый генератор с гарантированным вырезанием рассуждений и подменой ID ---
 
 async def stream_filter_generator(
     upstream_response: httpx.Response,
     requested_model: str = None,
     is_reasoning: int = 0,
-    orig_prompt_tokens: int = 0
+    orig_prompt_tokens: int = 0,
+    fixed_id: Optional[str] = None
 ):
     line_buffer = ""
     in_think = False
@@ -786,6 +810,9 @@ async def stream_filter_generator(
                         data["error"].pop("param", None)
                         yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
                         continue
+
+                    if fixed_id and "id" in data:
+                        data["id"] = fixed_id
 
                     if requested_model and "model" in data:
                         data["model"] = requested_model
@@ -890,10 +917,11 @@ async def anthropic_stream_generator(
     requested_model: str,
     is_reasoning: int,
     prompt_tokens: int,
+    fixed_id: str,
     delay_sec: float = 0.0,
     stream_throttle: bool = False
 ):
-    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    msg_id = fixed_id
 
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
@@ -929,7 +957,8 @@ async def anthropic_stream_generator(
         upstream_resp,
         requested_model=requested_model,
         is_reasoning=is_reasoning,
-        orig_prompt_tokens=prompt_tokens
+        orig_prompt_tokens=prompt_tokens,
+        fixed_id=fixed_id
     ):
         text_line = raw_line.decode("utf-8", errors="ignore").strip()
         if text_line.startswith("data: ") and text_line != "data: [DONE]":
@@ -1075,6 +1104,9 @@ async def anthropic_messages_endpoint(request: Request):
     orig_prompt_tokens = estimate_messages_tokens(openai_messages)
 
     model_info = next((m for m in MODEL_MAPPINGS_LIST if m[2] == requested_model), None)
+    owned_by = model_info[5] if model_info and len(model_info) > 5 and model_info[5] else "anthropic"
+    res_id, req_id = generate_provider_ids(owned_by)
+
     delay_sec = float(model_info[6]) if model_info and len(model_info) > 6 else 0.0
     stream_throttle = bool(model_info[7]) if model_info and len(model_info) > 7 else False
     is_reasoning = int(model_info[8]) if model_info and len(model_info) > 8 else 0
@@ -1158,6 +1190,7 @@ async def anthropic_messages_endpoint(request: Request):
                     requested_model=requested_model,
                     is_reasoning=is_reasoning,
                     prompt_tokens=orig_prompt_tokens,
+                    fixed_id=res_id,
                     delay_sec=delay_sec,
                     stream_throttle=stream_throttle
                 ):
@@ -1166,11 +1199,14 @@ async def anthropic_messages_endpoint(request: Request):
                 await upstream_resp.aclose()
                 await client.aclose()
 
-        return StreamingResponse(
-            anthropic_stream_wrapper(),
-            status_code=200,
-            headers={"content-type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
-        )
+        stream_headers = {
+            "content-type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "request-id": req_id,
+            "x-request-id": req_id
+        }
+        return StreamingResponse(anthropic_stream_wrapper(), status_code=200, headers=stream_headers)
 
     try:
         raw_body = await upstream_resp.aread()
@@ -1193,7 +1229,7 @@ async def anthropic_messages_endpoint(request: Request):
         comp_tokens = estimate_tokens_text(clean_content)
 
         anthropic_response_data = {
-            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "id": res_id,
             "type": "message",
             "role": "assistant",
             "model": requested_model,
@@ -1210,26 +1246,29 @@ async def anthropic_messages_endpoint(request: Request):
                 "output_tokens": comp_tokens
             }
         }
+        resp_headers = {
+            "request-id": req_id,
+            "x-request-id": req_id
+        }
         return Response(
             content=json.dumps(anthropic_response_data, ensure_ascii=False),
             status_code=200,
+            headers=resp_headers,
             media_type="application/json"
         )
     finally:
         await upstream_resp.aclose()
         await client.aclose()
 
-# --- Основной шлюз прокси ---
+# --- Основной шлюз прокси (OpenAI-совместимый) ---
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
 async def proxy(request: Request, path: str):
     clean_path = path.lstrip("/").lower()
 
-    # 1. Защита от прямого перехода в раздел цен
     if clean_path in ["pricing", "pricing/"]:
         return RedirectResponse(url="/", status_code=302)
 
-    # 2. Блокировка внутренних API цен NewAPI
     if any(clean_path.startswith(p) for p in ["api/pricing", "api/prices", "api/ratio", "api/model/pricing"]):
         return make_error_response("Not Found", status_code=404)
 
@@ -1257,13 +1296,17 @@ async def proxy(request: Request, path: str):
     delay_sec = 0.0
     stream_throttle = False
     is_reasoning = 0
+    owned_by = "openai"
 
     if requested_model:
         model_info = next((m for m in MODEL_MAPPINGS_LIST if m[2] == requested_model), None)
         if model_info:
+            owned_by = model_info[5] if len(model_info) > 5 and model_info[5] else "openai"
             delay_sec = float(model_info[6]) if len(model_info) > 6 else 0.0
             stream_throttle = bool(model_info[7]) if len(model_info) > 7 else False
             is_reasoning = int(model_info[8]) if len(model_info) > 8 else 0
+
+    res_id, req_id = generate_provider_ids(owned_by)
 
     if requested_model and isinstance(parsed_req, dict) and is_reasoning >= 1:
         reasoning_instruction = get_reasoning_prompt(is_reasoning)
@@ -1353,6 +1396,12 @@ async def proxy(request: Request, path: str):
     if "text/event-stream" in content_type:
         resp_headers = dict(upstream_resp.headers)
         resp_headers.pop("content-length", None)
+        for h in ["cf-ray", "cf-cache-status", "server", "x-powered-by", "x-request-id", "request-id"]:
+            resp_headers.pop(h, None)
+
+        resp_headers["x-request-id"] = req_id
+        if "anthropic" in owned_by.lower():
+            resp_headers["request-id"] = req_id
 
         if delay_sec > 0 or stream_throttle:
             async def buffered_stream_wrapper():
@@ -1362,7 +1411,8 @@ async def proxy(request: Request, path: str):
                         upstream_resp,
                         requested_model=requested_model,
                         is_reasoning=is_reasoning,
-                        orig_prompt_tokens=orig_prompt_tokens
+                        orig_prompt_tokens=orig_prompt_tokens,
+                        fixed_id=res_id
                     ):
                         collected_chunks.append(chunk)
 
@@ -1385,7 +1435,8 @@ async def proxy(request: Request, path: str):
                         upstream_resp,
                         requested_model=requested_model,
                         is_reasoning=is_reasoning,
-                        orig_prompt_tokens=orig_prompt_tokens
+                        orig_prompt_tokens=orig_prompt_tokens,
+                        fixed_id=res_id
                     ):
                         yield chunk
                 finally:
@@ -1398,7 +1449,6 @@ async def proxy(request: Request, path: str):
         raw_body = await upstream_resp.aread()
         text = raw_body.decode("utf-8", errors="ignore")
 
-        # 3. Модификация HTML страниц (вырезание кнопки цен с сайта)
         if "text/html" in content_type:
             if "</head>" in text:
                 text = text.replace("</head>", f"{PRICING_INJECTION}</head>", 1)
@@ -1407,7 +1457,6 @@ async def proxy(request: Request, path: str):
             else:
                 text = PRICING_INJECTION + text
 
-        # 4. Обработка API ответов
         try:
             data = json.loads(text)
             
@@ -1417,6 +1466,8 @@ async def proxy(request: Request, path: str):
 
             text = replace_models(text)
             data = json.loads(text)
+
+            data["id"] = res_id
 
             if requested_model and "model" in data:
                 data["model"] = requested_model
@@ -1459,6 +1510,13 @@ async def proxy(request: Request, path: str):
         resp_headers.pop("content-length", None)
         resp_headers.pop("content-encoding", None)
         resp_headers.pop("etag", None)
+        for h in ["cf-ray", "cf-cache-status", "server", "x-powered-by", "x-request-id", "request-id"]:
+            resp_headers.pop(h, None)
+
+        resp_headers["x-request-id"] = req_id
+        if "anthropic" in owned_by.lower():
+            resp_headers["request-id"] = req_id
+
         return Response(content=text, status_code=upstream_resp.status_code, headers=resp_headers)
     finally:
         await upstream_resp.aclose()
